@@ -35,6 +35,7 @@ mod resolve;
 pub(crate) use resolve::{realize_frame, resolve_implements_rule, type_implements};
 mod root;
 mod spawn;
+mod sql;
 mod stack_trace;
 mod string;
 mod sys;

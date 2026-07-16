@@ -129,6 +129,9 @@ pub const ALL: &[BuiltinFile] = &[
     builtin!("baml", "ns_time/plaindate.baml"),
     builtin!("baml", "ns_time/plaindatetime.baml"),
     builtin!("baml", "ns_time/zoneddatetime.baml"),
+    builtin!("baml", "ns_sql/sql.baml"),
+    builtin!("baml", "ns_sql/ns_postgres/postgres.baml"),
+    builtin!("baml", "ns_sql/ns_sqlite/sqlite.baml"),
     builtin!("baml", "ns_ops/comparison.baml"),
     // --- boundary package ---
     builtin!("boundary", "core.baml"),
@@ -175,5 +178,7 @@ pub fn stdlib_package_names() -> &'static [&'static str] {
 
 mod adt;
 mod media;
+mod sql;
 pub use adt::*;
 pub use media::{MediaContent, MediaValue};
+pub use sql::{SqlArrayType, SqlBindValue, SqlStatement};
