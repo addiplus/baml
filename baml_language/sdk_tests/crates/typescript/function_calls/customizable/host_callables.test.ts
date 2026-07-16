@@ -13,6 +13,7 @@ import {
   call_with_throwing_async,
   call_with_two_args_async,
 } from "./baml_sdk/host_callable_tests/index.js";
+import { isTestRuntime } from "./test_runtime.js";
 
 describe("function_calls — generated SDK host callables", () => {
   it("passes a plain function callback and returns a string", async () => {
@@ -40,9 +41,7 @@ describe("function_calls — generated SDK host callables", () => {
       throw new Error("nope");
     };
 
-    await expect(call_with_callback_async(cb, 1)).rejects.toThrow(
-      /nope|Error/,
-    );
+    await expect(call_with_callback_async(cb, 1)).rejects.toThrow(/nope|Error/);
   });
 
   it.skip("releases callable objects after the engine drops the HostClosure", async () => {
@@ -72,10 +71,7 @@ describe("function_calls — generated SDK host callables", () => {
     };
 
     await expect(
-      call_with_callback_async(
-        cb as unknown as (arg0: number) => string,
-        4,
-      ),
+      call_with_callback_async(cb as unknown as (arg0: number) => string, 4),
     ).resolves.toBe("async-4");
   });
 
@@ -203,3 +199,44 @@ describe("function_calls — optional-arg host callables (the combination)", () 
     ).resolves.toEqual([523]);
   });
 });
+
+describe.runIf(isTestRuntime("workers"))(
+  "Workers HOST_VALUE_CALLABLE contract",
+  () => {
+    it("round-trips a synchronous callable", async () => {
+      await expect(
+        call_with_callback_async((value) => `web-${value}`, 7),
+      ).resolves.toBe("web-7");
+    });
+
+    it("awaits a Promise returned by the callable", async () => {
+      const callback = async (value: number): Promise<string> => {
+        await Promise.resolve();
+        return `async-${value}`;
+      };
+      await expect(
+        call_with_callback_async(
+          callback as unknown as (value: number) => string,
+          9,
+        ),
+      ).resolves.toBe("async-9");
+    });
+
+    it("preserves named optional arguments", async () => {
+      const callback = (x: number, options?: { y?: number; z?: number }) =>
+        x * 100 + (options?.y ?? 8) * 10 + (options?.z ?? 9);
+      await expect(
+        call_callback_with_optional_args_partially_set_async(callback, 5),
+      ).resolves.toEqual([529, 583]);
+    });
+
+    it("routes callable throws through the VM catch path", async () => {
+      const callback = (): string => {
+        throw new Error("workerd host callable failed");
+      };
+      await expect(call_with_throwing_async(callback, 1)).resolves.toBe(
+        "caught:Error",
+      );
+    });
+  },
+);

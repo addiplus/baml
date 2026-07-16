@@ -61,7 +61,7 @@ Each SDK is implemented in two parts: an FFI to provide core runtime bindings an
 
 `sdk_test_typescript_web` provides coverage for
 
-  - `sdks/typescript/bridge_typescript_web`; runtime Vitest coverage remains ignored until the Web implementation change is applied
+  - `sdks/typescript/bridge_typescript_web`
   - `sdks/typescript/sdkgen_typescript_shared`
 
 ## Directory structure
