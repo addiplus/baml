@@ -821,10 +821,13 @@ fn symbol_kind_ord(sym: &EmittedSymbol) -> u8 {
 /// outside `body.symbols`.
 ///
 /// Guarantees:
-/// - **Non-keyword raw names map to themselves, unconditionally** — even if the
-///   name collides with a leaf class named `T` (that ordinary class-vs-TypeVar
-///   module collision is pre-existing on canary and explicitly NOT fixed this
-///   round). This preserves STRICT byte-identity for keyword-free schemas.
+/// - **Non-keyword raw names keep their spelling unless they collide.** An
+///   ordinary raw name bumps (`T`→`T_`→`T__`…) only when it equals a foreign
+///   module binding — a leaf class/enum/alias/function name, an import anchor,
+///   `__all__`, a child-module name, or an aggregated callable-child anchor —
+///   or an already-allocated emitted `TypeVar` name. A non-colliding ordinary
+///   name still maps to itself, so keyword-free schemas with no
+///   name-equals-binder collision remain STRICTLY byte-identical.
 /// - **Keyword raw names bump** (`None`→`None_`→`None__`…) past a reservation set
 ///   made of every module-level binding a bumped name could shadow:
 ///   (a) every leaf emitted symbol name (class/enum/alias/function `py_name`);
@@ -961,46 +964,63 @@ fn allocate_leaf_body_type_vars(body: &mut LeafBody, extra_reserved: Option<&BTr
         return; // no generics in this leaf — nothing to allocate
     }
 
-    // 2. Reservation set for keyword bumps.
-    let mut reserved: HashSet<String> = HashSet::new();
+    // 2. Reservation sets. `foreign` = module bindings that are NOT TypeVars:
+    //    (a) sym.py_name(), (b) root import anchors, (c) "__all__",
+    //    (f) extra_reserved (child-module + callable-child anchors). Deliberately
+    //    EXCLUDES (d) raw TypeVar names and (e) emitted TypeVar names — a raw
+    //    name must never see itself and self-trigger a bump.
+    let mut foreign: HashSet<String> = HashSet::new();
     // (a) every leaf-level emitted symbol name (class/enum/alias/function).
     for (sym, _) in &body.symbols {
-        reserved.insert(sym.py_name().to_string());
+        foreign.insert(sym.py_name().to_string());
     }
     // (b) module import anchors brought in through the SDK root.
     let imports = body.root_imports_py();
-    reserved.extend(imports.segments);
-    reserved.extend(imports.root_names);
+    foreign.extend(imports.segments);
+    foreign.extend(imports.root_names);
     // (c) the `__all__` module binding. The `_{name}_namespace` callable-child
     //     helpers are unreachable by keyword bumping (bumping only appends `_`,
     //     which can never produce a `_`-leading name), so they need no entry.
-    reserved.insert("__all__".to_string());
-    // (d) every raw TypeVar name in the leaf, any scope.
-    reserved.extend(raw_set.iter().cloned());
+    foreign.insert("__all__".to_string());
     // (f) module-level bindings this leaf emits that are NOT symbols or import
     //     anchors: immediate child-package/submodule names and keyword-escaped
     //     callable-child import anchors. Threaded in from the read-only
     //     pre-pass (`compute_module_binding_reservations`) because they are
     //     cross-body / render-time facts the per-body walk above cannot see —
-    //     omitting them would let a keyword TypeVar overwrite a real child module
+    //     omitting them would let a bumped TypeVar overwrite a real child module
     //     or rebind an imported child class.
     if let Some(extra) = extra_reserved {
-        reserved.extend(extra.iter().cloned());
+        foreign.extend(extra.iter().cloned());
     }
+    // Full guard for the bump while-loop: foreign + (d) raw names; (e) emitted
+    // names join as they are allocated.
+    let mut reserved: HashSet<String> = foreign.clone();
+    // (d) every raw TypeVar name in the leaf, any scope.
+    reserved.extend(raw_set.iter().cloned());
 
-    // 3. Allocate the ONE leaf map (raw -> emitted).
+    // 3. Allocate the ONE leaf map (raw -> emitted). An ordinary name keeps
+    //    its spelling UNLESS it would shadow a foreign module binding or a
+    //    TypeVar already emitted in this leaf. Keyword names always bump.
+    //    (`emitted_seen` is defensive: because `reserved` already contains every
+    //    raw spelling (d), a bump can never land on any raw name, so distinct
+    //    raws cannot collapse; the guard only becomes load-bearing if (d) is
+    //    ever narrowed.)
     let mut leaf_map: TypeVarMap = TypeVarMap::new();
+    let mut emitted_seen: HashSet<String> = HashSet::new();
     for raw in &raw_order {
-        if !crate::emit::is_python_hard_keyword(raw) {
-            leaf_map.insert(raw.clone(), raw.clone());
+        let collides = foreign.contains(raw.as_str()) || emitted_seen.contains(raw.as_str());
+        let emitted = if !crate::emit::is_python_hard_keyword(raw) && !collides {
+            raw.clone()
         } else {
             let mut candidate = format!("{raw}_");
             while crate::emit::is_python_hard_keyword(&candidate) || reserved.contains(&candidate) {
                 candidate.push('_');
             }
-            reserved.insert(candidate.clone()); // (e) already-allocated emitted names
-            leaf_map.insert(raw.clone(), candidate);
-        }
+            candidate
+        };
+        reserved.insert(emitted.clone()); // (e) already-allocated emitted names
+        emitted_seen.insert(emitted.clone());
+        leaf_map.insert(raw.clone(), emitted);
     }
 
     // 4. Project the leaf map onto each scope.

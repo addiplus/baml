@@ -4217,6 +4217,323 @@ mod tests {
         );
     }
 
+    /// An ordinary (non-keyword) class named `T` and a module-level `TypeVar`
+    /// spelled `T` both claim the module binding `T`. The class keeps its name;
+    /// the `TypeVar` bumps to `T_`, so `typing.Generic[...]` never receives the
+    /// concrete class and the module stays importable.
+    #[test]
+    fn ordinary_class_and_same_named_typevar_get_distinct_bindings() {
+        let mut pool: SymbolPool = HashMap::new();
+        let t = cg_name("user", &["lorem"], "T");
+        pool.insert(t.clone(), class_with_fields(t, &[("a", int_ty())]));
+        let boxn = cg_name("user", &["lorem"], "Box");
+        pool.insert(
+            boxn.clone(),
+            Symbol::Class(Class {
+                generic_params: vec![BaseName::new("T")],
+                name: boxn,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("item"),
+                    docstring: None,
+                    ty: type_var(BaseName::new("T")),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![],
+                origin: origin("box.baml", 0),
+            }),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let leaf = &out[&PathBuf::from("lorem/__init__.py")];
+        assert!(
+            leaf.contains("T_ = typing.TypeVar(\"T_\")\n"),
+            "bumped TypeVar decl missing:\n{leaf}"
+        );
+        // The shadowing decl is gone: no bare `T` TypeVar is declared.
+        assert!(
+            !leaf.contains("T = typing.TypeVar"),
+            "shadowing TypeVar decl still present:\n{leaf}"
+        );
+        // The class name is public identity and must not move.
+        assert!(
+            leaf.contains("class T(pydantic.BaseModel"),
+            "ordinary class name moved:\n{leaf}"
+        );
+        assert!(
+            leaf.contains("class Box(pydantic.BaseModel, typing.Generic[T_]):"),
+            "generic base did not pick up the bumped TypeVar:\n{leaf}"
+        );
+        assert!(leaf.contains("    item: T_\n"), "field ref:\n{leaf}");
+        // The stub mirrors the same allocation.
+        let pyi = &out[&PathBuf::from("lorem/__init__.pyi")];
+        assert!(
+            pyi.contains("T_ = typing.TypeVar(\"T_\")\n"),
+            "stub bumped TypeVar decl missing:\n{pyi}"
+        );
+        assert!(
+            !pyi.contains("T = typing.TypeVar"),
+            "stub shadowing TypeVar decl still present:\n{pyi}"
+        );
+    }
+
+    /// The same shadowing hole applies to every emitted symbol kind: an enum or
+    /// a type alias whose name equals a generic binder forces the `TypeVar` to
+    /// bump while the enum or alias name is emitted verbatim.
+    #[test]
+    fn enum_and_alias_names_force_same_named_typevar_to_bump() {
+        // Enum named `T` next to a generic `Box<T>`.
+        let mut enum_pool: SymbolPool = HashMap::new();
+        let et = cg_name("user", &["lorem"], "T");
+        enum_pool.insert(et.clone(), enum_with_variants(et, &[("A", "A")]));
+        let ebox = cg_name("user", &["lorem"], "Box");
+        enum_pool.insert(
+            ebox.clone(),
+            Symbol::Class(Class {
+                generic_params: vec![BaseName::new("T")],
+                name: ebox,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("item"),
+                    docstring: None,
+                    ty: type_var(BaseName::new("T")),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![],
+                origin: origin("box.baml", 0),
+            }),
+        );
+        let enum_leaf = &to_source_code(&enum_pool, &[], NamingConvention::PreserveCase)
+            [&PathBuf::from("lorem/__init__.py")];
+        assert!(
+            enum_leaf.contains("T_ = typing.TypeVar(\"T_\")\n"),
+            "enum: bumped TypeVar decl missing:\n{enum_leaf}"
+        );
+        assert!(
+            !enum_leaf.contains("T = typing.TypeVar"),
+            "enum: shadowing TypeVar decl still present:\n{enum_leaf}"
+        );
+        assert!(
+            enum_leaf.contains("class T(str, enum.Enum):"),
+            "enum name moved:\n{enum_leaf}"
+        );
+        assert!(
+            enum_leaf.contains("class Box(pydantic.BaseModel, typing.Generic[T_]):"),
+            "enum: generic base did not pick up the bumped TypeVar:\n{enum_leaf}"
+        );
+
+        // Type alias named `U` next to a generic `Box<U>`.
+        let mut alias_pool: SymbolPool = HashMap::new();
+        let au = cg_name("user", &["lorem"], "U");
+        alias_pool.insert(au.clone(), alias(au, "u.baml", 0));
+        let abox = cg_name("user", &["lorem"], "Box");
+        alias_pool.insert(
+            abox.clone(),
+            Symbol::Class(Class {
+                generic_params: vec![BaseName::new("U")],
+                name: abox,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("item"),
+                    docstring: None,
+                    ty: type_var(BaseName::new("U")),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![],
+                origin: origin("box.baml", 0),
+            }),
+        );
+        let alias_leaf = &to_source_code(&alias_pool, &[], NamingConvention::PreserveCase)
+            [&PathBuf::from("lorem/__init__.py")];
+        assert!(
+            alias_leaf.contains("U_ = typing.TypeVar(\"U_\")\n"),
+            "alias: bumped TypeVar decl missing:\n{alias_leaf}"
+        );
+        assert!(
+            !alias_leaf.contains("U = typing.TypeVar"),
+            "alias: shadowing TypeVar decl still present:\n{alias_leaf}"
+        );
+        assert!(
+            alias_leaf.contains("U: typing.TypeAlias = int\n"),
+            "alias line moved:\n{alias_leaf}"
+        );
+        assert!(
+            alias_leaf.contains("class Box(pydantic.BaseModel, typing.Generic[U_]):"),
+            "alias: generic base did not pick up the bumped TypeVar:\n{alias_leaf}"
+        );
+    }
+
+    /// When the bumped spelling is itself owned by another raw `TypeVar`, the
+    /// bump walks past it: a class `T` forces raw `T` to `T__` because raw `T_`
+    /// already owns `T_`. Distinct raws never collapse onto one emitted name.
+    #[test]
+    fn bumped_typevar_does_not_collapse_onto_existing_typevar_spelling() {
+        let mut pool: SymbolPool = HashMap::new();
+        let t = cg_name("user", &["lorem"], "T");
+        pool.insert(t.clone(), class_with_fields(t, &[("a", int_ty())]));
+        let boxn = cg_name("user", &["lorem"], "Box");
+        pool.insert(
+            boxn.clone(),
+            Symbol::Class(Class {
+                generic_params: vec![BaseName::new("T")],
+                name: boxn,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("item"),
+                    docstring: None,
+                    ty: type_var(BaseName::new("T")),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![],
+                origin: origin("box.baml", 0),
+            }),
+        );
+        // A free function already generic on the raw spelling `T_`.
+        let mut echo = bare_func("echo", "echo.baml", 0);
+        echo.generic_params = vec![BaseName::new("T_")];
+        echo.arguments = vec![FunctionArgument {
+            name: BaseName::new("value"),
+            docstring: None,
+            ty: type_var(BaseName::new("T_")),
+            default: None,
+        }];
+        echo.return_type = type_var(BaseName::new("T_"));
+        pool.insert(cg_name("user", &["lorem"], "echo"), Symbol::Function(echo));
+
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let leaf = &out[&PathBuf::from("lorem/__init__.py")];
+        // Raw `T_` keeps `T_`; raw `T` bumps clear of both the class and `T_`.
+        assert_eq!(
+            leaf.matches("T_ = typing.TypeVar(\"T_\")\n").count(),
+            1,
+            "natural TypeVar decl not present exactly once:\n{leaf}"
+        );
+        assert_eq!(
+            leaf.matches("T__ = typing.TypeVar(\"T__\")\n").count(),
+            1,
+            "bumped TypeVar decl not present exactly once:\n{leaf}"
+        );
+        assert!(
+            leaf.contains("class T(pydantic.BaseModel"),
+            "ordinary class name moved:\n{leaf}"
+        );
+        assert!(
+            leaf.contains("class Box(pydantic.BaseModel, typing.Generic[T__]):"),
+            "generic base did not bump past the taken spelling:\n{leaf}"
+        );
+        let pyi = &out[&PathBuf::from("lorem/__init__.pyi")];
+        assert!(
+            pyi.contains("def echo(value: T_, *, _types: dict[str, type]) -> T_: ..."),
+            "function signature did not keep its own TypeVar spelling:\n{pyi}"
+        );
+    }
+
+    /// The resolved mapping is the same whichever order the class and the
+    /// generic scope appear in the pool.
+    #[test]
+    fn class_typevar_shadow_resolution_is_declaration_order_independent() {
+        for class_first in [true, false] {
+            let mut pool: SymbolPool = HashMap::new();
+            let t = cg_name("user", &["lorem"], "T");
+            let t_sym = class_with_fields(t.clone(), &[("a", int_ty())]);
+            let boxn = cg_name("user", &["lorem"], "Box");
+            let box_sym = Symbol::Class(Class {
+                generic_params: vec![BaseName::new("T")],
+                name: boxn.clone(),
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("item"),
+                    docstring: None,
+                    ty: type_var(BaseName::new("T")),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![],
+                origin: origin("box.baml", 0),
+            });
+            if class_first {
+                pool.insert(t, t_sym);
+                pool.insert(boxn, box_sym);
+            } else {
+                pool.insert(boxn, box_sym);
+                pool.insert(t, t_sym);
+            }
+            let leaf = &to_source_code(&pool, &[], NamingConvention::PreserveCase)
+                [&PathBuf::from("lorem/__init__.py")];
+            assert!(
+                leaf.contains("T_ = typing.TypeVar(\"T_\")\n"),
+                "order class_first={class_first}: bumped decl missing:\n{leaf}"
+            );
+            assert!(
+                leaf.contains("class Box(pydantic.BaseModel, typing.Generic[T_]):"),
+                "order class_first={class_first}: generic base wrong:\n{leaf}"
+            );
+        }
+    }
+
+    /// A raw `TypeVar` spelling shared across two scopes with no same-named
+    /// symbol still emits exactly one module-level declaration and never bumps.
+    #[test]
+    fn shared_typevar_across_scopes_still_emits_one_declaration() {
+        let mut pool: SymbolPool = HashMap::new();
+        let boxn = cg_name("user", &["lorem"], "Box");
+        pool.insert(
+            boxn.clone(),
+            Symbol::Class(Class {
+                generic_params: vec![BaseName::new("T")],
+                name: boxn,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("item"),
+                    docstring: None,
+                    ty: type_var(BaseName::new("T")),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![],
+                origin: origin("box.baml", 0),
+            }),
+        );
+        let mut echo = bare_func("echo", "echo.baml", 0);
+        echo.generic_params = vec![BaseName::new("T")];
+        echo.arguments = vec![FunctionArgument {
+            name: BaseName::new("value"),
+            docstring: None,
+            ty: type_var(BaseName::new("T")),
+            default: None,
+        }];
+        echo.return_type = type_var(BaseName::new("T"));
+        pool.insert(cg_name("user", &["lorem"], "echo"), Symbol::Function(echo));
+
+        let leaf = &to_source_code(&pool, &[], NamingConvention::PreserveCase)
+            [&PathBuf::from("lorem/__init__.py")];
+        assert_eq!(
+            leaf.matches("T = typing.TypeVar(\"T\")\n").count(),
+            1,
+            "shared TypeVar not declared exactly once:\n{leaf}"
+        );
+        assert!(
+            !leaf.contains("T_ = typing.TypeVar"),
+            "spurious bump on a non-colliding shared TypeVar:\n{leaf}"
+        );
+    }
+
+    /// A leaf with a class named like a `TypeVar` but no generics anywhere
+    /// allocates nothing, so no `TypeVar` line is emitted at all.
+    #[test]
+    fn class_named_like_a_typevar_without_generics_is_untouched() {
+        let mut pool: SymbolPool = HashMap::new();
+        let t = cg_name("user", &["lorem"], "T");
+        pool.insert(t.clone(), class_with_fields(t, &[("a", int_ty())]));
+        let leaf = &to_source_code(&pool, &[], NamingConvention::PreserveCase)
+            [&PathBuf::from("lorem/__init__.py")];
+        assert!(
+            leaf.contains("class T(pydantic.BaseModel"),
+            "class name missing:\n{leaf}"
+        );
+        assert!(
+            !leaf.contains("typing.TypeVar"),
+            "unexpected TypeVar allocation for a non-generic leaf:\n{leaf}"
+        );
+    }
+
     // ── Reserved-word codegen: TypeVar allocation and stub aggregation ───────
 
     /// A leaf that already declares a class named `None__` plus a
