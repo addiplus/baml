@@ -878,13 +878,14 @@ pub(crate) fn allocate_leaf_type_vars(
 ///   (routing sanitized them), so reserving them verbatim is exact.
 /// - **(b) keyword-escaped callable-child import anchors.** `render_leaf_body_pyi`
 ///   aggregates a callable child's argument/return imports into the parent stub
-///   (`callable_child_parent_rel_imports`), gated to keyword-escaped classes.
-///   A bumped keyword `TypeVar` colliding with such a
-///   `from ... import None_` would rebind the imported class to the `TypeVar`.
-///   Only keyword-
-///   escaped anchors survive the gate, and those are exactly the collision
-///   candidates, so reserving just them suffices. Name-only: depth is irrelevant
-///   for a reservation set.
+///   (`callable_child_parent_rel_imports`), gated to keyword-escaped references.
+///   A bumped keyword `TypeVar` colliding with such an anchor would rebind that
+///   binding to the `TypeVar`. With the child-leaf routing these anchors are no
+///   longer exclusively bare keyword escapes: a bare child-leaf class reserves
+///   `None_`, while a dotted route reserves its top module segment (e.g.
+///   `stream_types`, `vendor`) as well. Reserving the module segment too is
+///   intentional — it protects every dotted annotation through that segment from a
+///   `TypeVar` bump. Name-only: depth is irrelevant for a reservation set.
 fn compute_module_binding_reservations(
     bodies: &BTreeMap<LeafPath, LeafBody>,
     children: &BTreeMap<Vec<String>, BTreeSet<String>>,
@@ -2448,25 +2449,27 @@ fn render_literal_default(lit: &Literal) -> String {
     }
 }
 
-/// KEYWORD-GATED: rel-imports needed by the callable-child
-/// function signatures that `render_callable_child_protocol_pyi` renders into the
-/// PARENT stub, computed relative to the PARENT leaf so depths/anchors match the
-/// parent stub (the child's own `all_rel_imports_py` would use child-leaf depths —
-/// one level too deep). Only child *functions* are rendered into the parent, so
-/// only their arg/return types are walked.
+/// KEYWORD-GATED: rel-imports needed by the callable-child function signatures
+/// that `render_callable_child_protocol_pyi` renders into the PARENT stub. The
+/// renderer translates each child function's annotations under the CHILD leaf's
+/// perspective, so the aggregation threads that same child leaf through the walk
+/// and anchors the resulting imports at the PARENT leaf — the rendering
+/// perspective and the import anchor are split (see
+/// `record_callable_child_name_routing`). Only child *functions* are rendered into
+/// the parent, so only their arg/return types are walked.
 ///
 /// The walk is gated to keyword-ESCAPED class/enum/alias anchors only
-/// (`collect_keyword_escaped_root_imports`): a keyword-free callable child (one
+/// (`collect_callable_child_root_imports`): a keyword-free callable child (one
 /// returning an ordinary root class `Widget`) contributes NOTHING, so keyword-free
 /// parent stubs stay strictly byte-identical, while keyword-escaped anchors —
-/// the only names that can collide with a bumped keyword `TypeVar` — are
-/// still aggregated and bound. The general keyword-free unbound-stub case an
+/// the only names that can collide with a bumped keyword `TypeVar` — are still
+/// aggregated and bound. The general keyword-free unbound-stub case an
 /// unconditional walk would also fix is pre-existing on canary and is left as a
 /// disclosed follow-up. Provenance is unambiguous at codegen (the arg/return `Ty`
 /// carries the class's raw BAML name), unlike the bridge's runtime shape ambiguity.
-/// Isolated to this one fn + its two callers (the render site and the reservation
-/// pre-pass) so the whole aggregation can be dropped
-/// deterministically if the keyword-free fixtures move.
+/// The OUTER signature does not change, so both callers — the render site and the
+/// reservation pre-pass — pick up the child-leaf routing in lock-step with no
+/// caller edits, keeping the render path and the reservation set consistent.
 fn callable_child_parent_rel_imports(
     parent_leaf: &LeafPath,
     callable_child_bodies: &BTreeMap<String, &LeafBody>,
@@ -2476,85 +2479,136 @@ fn callable_child_parent_rel_imports(
         for (sym, _) in &child_body.symbols {
             if let EmittedSymbol::Function(f) = sym {
                 for ty in &f.arg_tys {
-                    collect_keyword_escaped_root_imports(ty, parent_leaf, &mut acc);
+                    collect_callable_child_root_imports(
+                        ty,
+                        parent_leaf,
+                        &child_body.leaf,
+                        &mut acc,
+                    );
                 }
-                collect_keyword_escaped_root_imports(&f.return_ty, parent_leaf, &mut acc);
+                collect_callable_child_root_imports(
+                    &f.return_ty,
+                    parent_leaf,
+                    &child_body.leaf,
+                    &mut acc,
+                );
             }
         }
     }
     acc.into_rel()
 }
 
-/// Structural mirror of `collect_root_imports` restricted to root-routed
-/// references whose RAW BAML name is a Python hard keyword — i.e. the anchor the
-/// translator emits is a generated keyword-escape (`None`→`None_`). Every other
-/// reference (keyword-free classes, module-segment routes, `Ty::Media`,
-/// primitives) is intentionally skipped so the aggregation is a no-op for
-/// keyword-free schemas. Recurses through the same container/callable shapes as
-/// `collect_root_imports` so a keyword class nested in `List[..]`/`Union[..]`/a
-/// callback signature is still found.
-fn collect_keyword_escaped_root_imports(ty: &Ty, current: &LeafPath, out: &mut RootImportSets) {
+/// Structural mirror of `collect_root_imports` restricted to references whose RAW
+/// BAML name is a Python hard keyword, resolved with the child leaf as the
+/// rendering perspective (see `record_callable_child_name_routing`). Recurses
+/// through the same container/callable shapes as `collect_root_imports` so a
+/// keyword class nested in `List[..]`/`Union[..]`/a callback signature is still
+/// found. The keyword gate keeps the aggregation a no-op for keyword-free schemas.
+fn collect_callable_child_root_imports(
+    ty: &Ty,
+    current: &LeafPath,
+    child_leaf: &LeafPath,
+    out: &mut RootImportSets,
+) {
     match ty {
         Ty::Class(name, args, _) => {
-            record_keyword_escaped_name_routing(name, current, out);
+            record_callable_child_name_routing(name, current, child_leaf, out);
             for a in args {
-                collect_keyword_escaped_root_imports(a, current, out);
+                collect_callable_child_root_imports(a, current, child_leaf, out);
             }
         }
         Ty::Enum(name, _) | Ty::EnumVariant(name, _, _) | Ty::TypeAlias(name, _) => {
-            record_keyword_escaped_name_routing(name, current, out);
+            record_callable_child_name_routing(name, current, child_leaf, out);
         }
-        Ty::List(inner, _) => collect_keyword_escaped_root_imports(inner, current, out),
+        Ty::List(inner, _) => collect_callable_child_root_imports(inner, current, child_leaf, out),
         Ty::Map { key, value, .. } => {
-            collect_keyword_escaped_root_imports(key, current, out);
-            collect_keyword_escaped_root_imports(value, current, out);
+            collect_callable_child_root_imports(key, current, child_leaf, out);
+            collect_callable_child_root_imports(value, current, child_leaf, out);
         }
         Ty::Union(items, _) => {
             for item in items {
-                collect_keyword_escaped_root_imports(item, current, out);
+                collect_callable_child_root_imports(item, current, child_leaf, out);
             }
         }
         Ty::Function { params, ret, .. } => {
             for p in params {
-                collect_keyword_escaped_root_imports(&p.ty, current, out);
+                collect_callable_child_root_imports(&p.ty, current, child_leaf, out);
             }
-            collect_keyword_escaped_root_imports(ret, current, out);
+            collect_callable_child_root_imports(ret, current, child_leaf, out);
         }
-        // Everything else can never be a keyword-escaped root-class anchor:
-        // `Ty::Media` anchors on module segment `baml` (not keyword-escaped),
-        // module-segment routing for keyword namespaces is a disclosed follow-up
-        // (`sanitize_python_module_segment`), and primitives/`TypeVar`/`RustType`
-        // route nothing.
+        // While the keyword gate is in place the remaining shapes contribute no
+        // anchor: keyword-free classes, module-segment routes, `Ty::Media`,
+        // primitives, `TypeVar`, and `RustType` all fall here.
         _ => {}
     }
 }
 
-/// `record_name_routing` restricted to root-routed references whose RAW BAML name
-/// is a Python hard keyword. Only the root-routed branch can produce a keyword-
-/// escaped bare anchor (`None`→`None_`); a non-empty `routed.segments` is a
-/// module-segment route (never keyword-escaped today, disclosed follow-up) and is
-/// skipped. Mirrors the escaped-spelling contract of `record_name_routing`'s
-/// root branch so the reserved anchor and the emitted `from ... import None_`
-/// stay identical.
-fn record_keyword_escaped_name_routing(
+/// `record_name_routing` restricted to references whose RAW BAML name is a Python
+/// hard keyword, with the RENDERING PERSPECTIVE (the child leaf the annotation was
+/// translated under) split from the IMPORT ANCHOR (the parent leaf the stub lives
+/// in). The three branches mirror the shapes `render_name_ref` emits:
+///
+/// 1. a class routed to the child leaf renders BARE, so it is bound from the child
+///    subpackage relative to the parent module (`from .id import None_`);
+/// 2. a root-routed class renders BARE from the SDK root and keeps its existing
+///    root-anchored binding (`from ... import None_`);
+/// 3. any other route (the parent leaf itself, a sibling child, a third leaf, a
+///    `$stream` view) renders DOTTED, so its top routed segment is imported from
+///    the SDK root, exactly as the general `record_name_routing` non-root branch
+///    does.
+///
+/// The keyword gate keeps the aggregation a no-op for keyword-free schemas, so the
+/// generated output stays byte-identical for them.
+fn record_callable_child_name_routing(
     name: &baml_codegen_types::Name,
-    current: &LeafPath,
+    current: &LeafPath,    // the PARENT leaf: import depths anchor here
+    child_leaf: &LeafPath, // the leaf the annotation was rendered under
     out: &mut RootImportSets,
 ) {
-    let routed = route_class_ref(name);
-    if routed == *current {
+    if !crate::emit::is_python_hard_keyword(name.bare_name()) {
         return;
     }
-    if routed.segments.is_empty()
-        && !current.segments.is_empty()
-        && crate::emit::is_python_hard_keyword(name.bare_name())
-    {
+    let routed = route_class_ref(name);
+    let child_extends_parent = routed.segments.len() > current.segments.len()
+        && routed.segments[..current.segments.len()] == current.segments[..];
+    if routed == *child_leaf && child_extends_parent {
+        // Rendered BARE (the class lives on the child leaf). Bind the bare name
+        // from the child subpackage, relative to the parent module.
         let bare = escape_python_keyword(name.bare_name().to_string());
+        let tail = routed.segments[current.segments.len()..].join(".");
         out.root_names.insert(bare.clone());
+        out.rel.insert(RelImport {
+            depth: 1,
+            from_path: tail,
+            anchor: bare,
+        });
+    } else if routed.segments.is_empty() {
+        // Rendered BARE from the SDK root — the existing root-anchored case. The
+        // root leaf itself never reaches here (current is also empty, so
+        // `routed == *child_leaf` above would need a non-extending match).
+        if !current.segments.is_empty() {
+            let bare = escape_python_keyword(name.bare_name().to_string());
+            out.root_names.insert(bare.clone());
+            out.rel.insert(RelImport {
+                depth: current.segments.len() + 1,
+                from_path: String::new(),
+                anchor: bare,
+            });
+        }
+    } else {
+        // Rendered DOTTED absolute — a class routed to the parent leaf itself, to
+        // a sibling child, to a third leaf, or a `$stream` view. Import the top
+        // routed segment from the SDK root; the per-package `__init__` cascade
+        // binds deeper segments and the definition site binds the escaped final
+        // attribute, mirroring `record_name_routing`'s non-root branch. This is
+        // also the defensive landing spot when a class routes to the child leaf
+        // but does not extend the parent (structurally unreachable: callable
+        // children always nest under their parent).
+        out.segments.insert(routed.segments[0].clone());
         out.rel.insert(RelImport {
             depth: current.segments.len() + 1,
             from_path: String::new(),
-            anchor: bare,
+            anchor: routed.segments[0].clone(),
         });
     }
 }

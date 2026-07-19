@@ -4755,6 +4755,246 @@ mod tests {
         );
     }
 
+    /// A callable child returning a KEYWORD class defined on the child's OWN leaf.
+    /// The parent stub renders the annotation bare (child perspective), so the
+    /// escaped name must be imported from the child subpackage
+    /// (`from .id import None_`). Historically the non-root routed anchor was
+    /// dropped, leaving the bare name unbound.
+    #[test]
+    fn callable_child_keyword_class_on_child_leaf_gets_parent_stub_import() {
+        let mut pool: SymbolPool = HashMap::new();
+        // Keyword class `None` on the CHILD leaf `vendor/boundary/id`.
+        let none_child = cg_name("boundary", &["id"], "None");
+        pool.insert(none_child.clone(), class(none_child.clone()));
+        // Parent callable `boundary.id` returns `str`.
+        pool.insert(
+            cg_name("boundary", &[], "id"),
+            zero_arg_func(
+                "id",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "core.baml",
+                0,
+            ),
+        );
+        // Child `boundary.id.current` returns the child-leaf keyword class.
+        pool.insert(
+            cg_name("boundary", &["id"], "current"),
+            zero_arg_func("current", class_ty(none_child, vec![]), "id.baml", 0),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
+        assert!(
+            pyi.contains("from .id import None_\n"),
+            "parent stub missing child-subpackage import:\n{pyi}"
+        );
+        assert!(
+            pyi.contains("def current(self) -> None_: ..."),
+            "child signature not rendered bare in parent stub:\n{pyi}"
+        );
+    }
+
+    /// A callable child returning a `$stream` KEYWORD class routed under
+    /// `stream_types/lorem`. The child perspective renders it DOTTED
+    /// (`stream_types.lorem.None_`), so the parent stub must import the top routed
+    /// segment `stream_types` from the SDK root.
+    #[test]
+    fn callable_child_stream_keyword_return_imports_stream_types_segment() {
+        let mut pool: SymbolPool = HashMap::new();
+        pool.insert(
+            cg_name("boundary", &[], "id"),
+            zero_arg_func(
+                "id",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "core.baml",
+                0,
+            ),
+        );
+        // Child returns a `$stream` keyword class routed to `stream_types/lorem`.
+        let streamed = cg_name("user", &["lorem"], "None$stream");
+        pool.insert(
+            cg_name("boundary", &["id"], "current"),
+            zero_arg_func("current", class_ty(streamed, vec![]), "id.baml", 0),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
+        assert!(
+            pyi.contains("from ... import stream_types\n"),
+            "parent stub missing top routed segment import:\n{pyi}"
+        );
+        assert!(
+            pyi.contains("-> stream_types.lorem.None_"),
+            "child annotation not rendered dotted:\n{pyi}"
+        );
+    }
+
+    /// A callable child returning a KEYWORD class defined on the PARENT leaf
+    /// itself. Under the child perspective this renders DOTTED
+    /// (`vendor.boundary.None_`), so the parent stub must import the top routed
+    /// segment `vendor`. This pins removal of the historical early return that
+    /// skipped a class routed to the parent leaf.
+    #[test]
+    fn callable_child_keyword_class_on_parent_leaf_imports_top_segment() {
+        let mut pool: SymbolPool = HashMap::new();
+        // Keyword class `None` on the PARENT leaf `vendor/boundary`.
+        let none_parent = cg_name("boundary", &[], "None");
+        pool.insert(none_parent.clone(), class(none_parent.clone()));
+        pool.insert(
+            cg_name("boundary", &[], "id"),
+            zero_arg_func(
+                "id",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "core.baml",
+                0,
+            ),
+        );
+        // Child returns the parent-leaf keyword class.
+        pool.insert(
+            cg_name("boundary", &["id"], "current"),
+            zero_arg_func("current", class_ty(none_parent, vec![]), "id.baml", 0),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
+        assert!(
+            pyi.contains("from ... import vendor\n"),
+            "parent stub missing top routed segment import:\n{pyi}"
+        );
+        assert!(
+            pyi.contains("-> vendor.boundary.None_"),
+            "child annotation not rendered dotted:\n{pyi}"
+        );
+    }
+
+    /// A parent leaf owning generic raw `None` whose callable child returns a
+    /// keyword class on the CHILD leaf. The stub aggregation adds
+    /// `from .id import None_`; the reservation pre-pass reserves that anchor so
+    /// the generic `TypeVar` bumps to `None__`, leaving `None_` denoting the
+    /// imported class rather than being rebound to a `TypeVar`.
+    #[test]
+    fn keyword_typevar_bumps_past_child_leaf_import_anchor() {
+        let mut pool: SymbolPool = HashMap::new();
+        // Keyword class `None` on the CHILD leaf.
+        let none_child = cg_name("boundary", &["id"], "None");
+        pool.insert(none_child.clone(), class(none_child.clone()));
+        pool.insert(
+            cg_name("boundary", &[], "id"),
+            zero_arg_func(
+                "id",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "core.baml",
+                0,
+            ),
+        );
+        pool.insert(
+            cg_name("boundary", &["id"], "current"),
+            zero_arg_func("current", class_ty(none_child, vec![]), "id.baml", 0),
+        );
+        // The SAME parent leaf `vendor/boundary` owns generic raw `None`, whose
+        // TypeVar would (unreserved) collide with the aggregated `None_` anchor.
+        let boxn = cg_name("boundary", &[], "Box");
+        pool.insert(
+            boxn.clone(),
+            Symbol::Class(Class {
+                generic_params: vec![BaseName::new("None")],
+                name: boxn,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("item"),
+                    docstring: None,
+                    ty: type_var(BaseName::new("None")),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![],
+                origin: origin("box.baml", 5),
+            }),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
+        assert!(
+            pyi.contains("from .id import None_\n"),
+            "aggregated child-subpackage import anchor dropped:\n{pyi}"
+        );
+        assert!(
+            pyi.contains("None__ = typing.TypeVar(\"None__\")\n"),
+            "TypeVar did not bump past the child import anchor:\n{pyi}"
+        );
+        assert!(
+            !pyi.contains("None_ = typing.TypeVar"),
+            "TypeVar rebound the imported child class None_:\n{pyi}"
+        );
+    }
+
+    /// Negative control (keyword gate holds): a KEYWORD-FREE callable child
+    /// returning an ordinary class on the child's own leaf must NOT change the
+    /// parent stub while the gate is in place, proving the routing substrate does
+    /// not by itself bind ordinary types.
+    #[test]
+    fn keyword_free_callable_child_child_leaf_class_adds_no_import() {
+        let mut pool: SymbolPool = HashMap::new();
+        // ORDINARY class on the CHILD leaf.
+        let widget = cg_name("boundary", &["id"], "Widget");
+        pool.insert(widget.clone(), class(widget.clone()));
+        pool.insert(
+            cg_name("boundary", &[], "id"),
+            zero_arg_func(
+                "id",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "core.baml",
+                0,
+            ),
+        );
+        pool.insert(
+            cg_name("boundary", &["id"], "current"),
+            zero_arg_func("current", class_ty(widget, vec![]), "id.baml", 0),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
+        assert!(
+            !pyi.contains("import Widget"),
+            "keyword-free child-leaf class changed the parent stub (gate not holding):\n{pyi}"
+        );
+    }
+
+    /// Negative control (keyword gate holds): a KEYWORD-FREE callable child
+    /// returning an ordinary `$stream` class must NOT add a `stream_types` import
+    /// to the parent stub while the gate is in place.
+    #[test]
+    fn keyword_free_stream_callable_child_adds_no_import() {
+        let mut pool: SymbolPool = HashMap::new();
+        pool.insert(
+            cg_name("boundary", &[], "id"),
+            zero_arg_func(
+                "id",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "core.baml",
+                0,
+            ),
+        );
+        // ORDINARY `$stream` class routed to `stream_types/lorem`.
+        let streamed = cg_name("user", &["lorem"], "Resume$stream");
+        pool.insert(
+            cg_name("boundary", &["id"], "current"),
+            zero_arg_func("current", class_ty(streamed, vec![]), "id.baml", 0),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
+        assert!(
+            !pyi.contains("import stream_types"),
+            "keyword-free stream child changed the parent stub (gate not holding):\n{pyi}"
+        );
+    }
+
     /// Generator-side marker emission: the provenance markers the
     /// bridge encoder consumes are emitted ONLY on keyword-escaped artifacts and
     /// ONLY in the runtime `.py` (never the `.pyi` stub). A class with ≥1 escaped
