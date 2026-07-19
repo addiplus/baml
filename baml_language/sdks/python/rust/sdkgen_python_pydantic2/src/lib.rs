@@ -4707,14 +4707,12 @@ mod tests {
         );
     }
 
-    /// Negative control that makes the restored byte-identity
-    /// universal falsifiable: a KEYWORD-FREE callable child returning ordinary
-    /// root class `Widget` must NOT change the parent stub — the keyword-gate
-    /// suppresses the stub aggregation, so no `import Widget` line appears (byte-
-    /// identical to parent/canary, whose keyword-free unbound-stub bug is a
-    /// disclosed pre-existing follow-up).
+    /// A KEYWORD-FREE callable child returning an ordinary root class `Widget`. The
+    /// parent stub renders `def current(self) -> Widget` and now binds `Widget` via
+    /// a guarded import (`from ... import Widget` inside `if typing.TYPE_CHECKING:`).
+    /// This is the previously-unbound keyword-free shape this branch corrects.
     #[test]
-    fn keyword_free_callable_child_class_return_stays_byte_identical() {
+    fn keyword_free_callable_child_binds_root_class_in_parent_stub() {
         let mut pool: SymbolPool = HashMap::new();
         // Root-routed ORDINARY class (not a keyword).
         let widget = cg_name("user", &[], "Widget");
@@ -4738,20 +4736,26 @@ mod tests {
         );
         let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
         let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
-        // The child signature is still rendered into the parent stub (pre-existing
-        // behavior, unchanged) …
+        // The child signature is rendered into the parent stub …
         assert!(
             pyi.contains("def current(self) -> Widget: ..."),
             "child signature not in parent stub:\n{pyi}"
         );
-        // … but the keyword-gate suppresses the aggregated import: NO `import
-        // Widget` line. Under an unconditional aggregation this would be
-        // `from ... import Widget`, which is exactly the keyword-free output delta
-        // that broke byte-identity. Its absence pins strict byte-identity for
-        // keyword-free schemas.
+        // … and the ordinary root class is now bound (parent leaf depth = 3 dots).
         assert!(
-            !pyi.contains("import Widget"),
-            "keyword-free callable child changed the parent stub (aggregation not gated):\n{pyi}"
+            pyi.contains("from ... import Widget\n"),
+            "parent stub missing aggregated root import:\n{pyi}"
+        );
+        // The binding import lives inside the guarded TYPE_CHECKING block.
+        let guard = pyi
+            .find("if typing.TYPE_CHECKING:")
+            .expect("stub missing TYPE_CHECKING guard");
+        let import = pyi
+            .find("from ... import Widget\n")
+            .expect("stub missing Widget import");
+        assert!(
+            import > guard,
+            "Widget import not inside the TYPE_CHECKING block:\n{pyi}"
         );
     }
 
@@ -4931,12 +4935,12 @@ mod tests {
         );
     }
 
-    /// Negative control (keyword gate holds): a KEYWORD-FREE callable child
-    /// returning an ordinary class on the child's own leaf must NOT change the
-    /// parent stub while the gate is in place, proving the routing substrate does
-    /// not by itself bind ordinary types.
+    /// A KEYWORD-FREE callable child returning an ordinary class on the child's own
+    /// leaf. The child perspective renders it bare, so the parent stub binds it
+    /// from the child subpackage. This is the case a naive root-only ungate would
+    /// miss, which is why the child-leaf routing is the shared substrate.
     #[test]
-    fn keyword_free_callable_child_child_leaf_class_adds_no_import() {
+    fn keyword_free_callable_child_binds_class_from_child_package() {
         let mut pool: SymbolPool = HashMap::new();
         // ORDINARY class on the CHILD leaf.
         let widget = cg_name("boundary", &["id"], "Widget");
@@ -4959,16 +4963,20 @@ mod tests {
         let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
         let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
         assert!(
-            !pyi.contains("import Widget"),
-            "keyword-free child-leaf class changed the parent stub (gate not holding):\n{pyi}"
+            pyi.contains("from .id import Widget\n"),
+            "parent stub missing child-subpackage import for ordinary class:\n{pyi}"
+        );
+        assert!(
+            pyi.contains("def current(self) -> Widget: ..."),
+            "child signature not rendered bare in parent stub:\n{pyi}"
         );
     }
 
-    /// Negative control (keyword gate holds): a KEYWORD-FREE callable child
-    /// returning an ordinary `$stream` class must NOT add a `stream_types` import
-    /// to the parent stub while the gate is in place.
+    /// A KEYWORD-FREE callable child returning an ordinary `$stream` class routed
+    /// under `stream_types/lorem`. The child perspective renders it dotted, so the
+    /// parent stub imports the top routed segment `stream_types`.
     #[test]
-    fn keyword_free_stream_callable_child_adds_no_import() {
+    fn keyword_free_stream_callable_child_imports_stream_types_segment() {
         let mut pool: SymbolPool = HashMap::new();
         pool.insert(
             cg_name("boundary", &[], "id"),
@@ -4990,8 +4998,227 @@ mod tests {
         let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
         let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
         assert!(
-            !pyi.contains("import stream_types"),
-            "keyword-free stream child changed the parent stub (gate not holding):\n{pyi}"
+            pyi.contains("from ... import stream_types\n"),
+            "parent stub missing top routed segment import for ordinary stream class:\n{pyi}"
+        );
+    }
+
+    /// A KEYWORD-FREE callable child returning a root class inside container types
+    /// (`List`, `Union`, `Map` value). Each recursion routes the root class, but
+    /// the aggregated imports dedup to exactly one `from ... import Widget`.
+    #[test]
+    fn keyword_free_callable_child_binds_root_class_inside_containers() {
+        let mut pool: SymbolPool = HashMap::new();
+        let widget = cg_name("user", &[], "Widget");
+        pool.insert(widget.clone(), class(widget.clone()));
+        pool.insert(
+            cg_name("boundary", &[], "id"),
+            zero_arg_func(
+                "id",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "core.baml",
+                0,
+            ),
+        );
+        // List[Widget]
+        pool.insert(
+            cg_name("boundary", &["id"], "in_list"),
+            zero_arg_func(
+                "in_list",
+                list(Box::new(class_ty(widget.clone(), vec![]))),
+                "id.baml",
+                0,
+            ),
+        );
+        // Union[Widget, null]
+        pool.insert(
+            cg_name("boundary", &["id"], "in_union"),
+            zero_arg_func(
+                "in_union",
+                union(vec![
+                    class_ty(widget.clone(), vec![]),
+                    Ty::Null {
+                        attr: baml_base::TyAttr::EMPTY,
+                    },
+                ]),
+                "id.baml",
+                1,
+            ),
+        );
+        // Map[str, Widget]
+        pool.insert(
+            cg_name("boundary", &["id"], "in_map"),
+            zero_arg_func(
+                "in_map",
+                Ty::Map {
+                    key: Box::new(Ty::String {
+                        attr: baml_base::TyAttr::EMPTY,
+                    }),
+                    value: Box::new(class_ty(widget, vec![])),
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "id.baml",
+                2,
+            ),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
+        let count = pyi.matches("from ... import Widget\n").count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one deduped Widget import across containers:\n{pyi}"
+        );
+    }
+
+    /// The root-class import anchors at the PARENT leaf's depth, not the child's.
+    /// Parent leaf `a` (one segment) → two dots (`from .. import Widget`).
+    #[test]
+    fn keyword_free_callable_child_root_import_depth_matches_parent_leaf() {
+        let mut pool: SymbolPool = HashMap::new();
+        let widget = cg_name("user", &[], "Widget");
+        pool.insert(widget.clone(), class(widget.clone()));
+        // Parent callable at leaf `a`.
+        pool.insert(
+            cg_name("user", &["a"], "outer"),
+            zero_arg_func(
+                "outer",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "a.baml",
+                0,
+            ),
+        );
+        // Child at leaf `a/outer` returns the root class.
+        pool.insert(
+            cg_name("user", &["a", "outer"], "inner"),
+            zero_arg_func("inner", class_ty(widget, vec![]), "outer.baml", 0),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("a/__init__.pyi")];
+        assert!(
+            pyi.contains("from .. import Widget\n"),
+            "parent stub import depth wrong for parent leaf `a`:\n{pyi}"
+        );
+    }
+
+    /// A callable child taking a media-typed argument. Media routes to `baml/media`
+    /// and renders `baml.media.Image`, so the parent stub imports the top segment
+    /// `baml`, the same shape the general import walk aggregates.
+    #[test]
+    fn callable_child_media_argument_imports_baml_segment() {
+        let mut pool: SymbolPool = HashMap::new();
+        pool.insert(
+            cg_name("boundary", &[], "id"),
+            zero_arg_func(
+                "id",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "core.baml",
+                0,
+            ),
+        );
+        // Child takes a media argument.
+        pool.insert(
+            cg_name("boundary", &["id"], "current"),
+            Symbol::Function(Function {
+                generic_params: Vec::new(),
+                name: BaseName::new("current"),
+                docstring: None,
+                arguments: vec![FunctionArgument {
+                    name: BaseName::new("img"),
+                    docstring: None,
+                    ty: Ty::Media(baml_base::MediaKind::Image, baml_base::TyAttr::EMPTY),
+                    default: None,
+                }],
+                return_type: Ty::Int {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                throws: None,
+                watchers: vec![],
+                origin: origin("id.baml", 0),
+            }),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("vendor/boundary/__init__.pyi")];
+        assert!(
+            pyi.contains("from ... import baml\n"),
+            "parent stub missing baml segment import for media arg:\n{pyi}"
+        );
+    }
+
+    /// Permanent control: a callable child at the SDK root returning a root class
+    /// needs NO import — the class is already bound in the same root module, and
+    /// the child perspective renders it bare.
+    #[test]
+    fn root_leaf_callable_child_root_class_needs_no_import() {
+        let mut pool: SymbolPool = HashMap::new();
+        let widget = cg_name("user", &[], "Widget");
+        pool.insert(widget.clone(), class(widget.clone()));
+        // Parent callable at the SDK root.
+        pool.insert(
+            cg_name("user", &[], "outer"),
+            zero_arg_func(
+                "outer",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "root.baml",
+                0,
+            ),
+        );
+        // Child at leaf `outer` returns the root class.
+        pool.insert(
+            cg_name("user", &["outer"], "inner"),
+            zero_arg_func("inner", class_ty(widget, vec![]), "outer.baml", 0),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let pyi = &out[&PathBuf::from("__init__.pyi")];
+        assert!(
+            pyi.contains("def inner(self) -> Widget: ..."),
+            "child signature not in root parent stub:\n{pyi}"
+        );
+        assert!(
+            !pyi.contains("from . import Widget"),
+            "root parent stub should not import a same-module class:\n{pyi}"
+        );
+    }
+
+    /// Permanent control: the callable-child stub aggregation is `.pyi`-only. The
+    /// runtime `.py` never references a callable-child annotation, so the fix adds
+    /// no import and no type name to the runtime module.
+    #[test]
+    fn callable_child_stub_imports_stay_out_of_runtime_module() {
+        let mut pool: SymbolPool = HashMap::new();
+        let widget = cg_name("user", &[], "Widget");
+        pool.insert(widget.clone(), class(widget.clone()));
+        pool.insert(
+            cg_name("boundary", &[], "id"),
+            zero_arg_func(
+                "id",
+                Ty::String {
+                    attr: baml_base::TyAttr::EMPTY,
+                },
+                "core.baml",
+                0,
+            ),
+        );
+        pool.insert(
+            cg_name("boundary", &["id"], "current"),
+            zero_arg_func("current", class_ty(widget, vec![]), "id.baml", 0),
+        );
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let py = &out[&PathBuf::from("vendor/boundary/__init__.py")];
+        assert!(
+            !py.contains("Widget"),
+            "runtime module leaked a callable-child annotation type:\n{py}"
+        );
+        assert!(
+            !py.contains("from .id import"),
+            "runtime module leaked a callable-child stub import:\n{py}"
         );
     }
 
