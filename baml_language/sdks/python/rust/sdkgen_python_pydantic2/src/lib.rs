@@ -4983,6 +4983,323 @@ mod tests {
         );
     }
 
+    /// A keyword field and an instance method whose plain spelling escapes to the
+    /// same identifier converge on one class-body name (field `pass` escapes to
+    /// `pass_`, method `pass_` is already a legal identifier). The method binding
+    /// renders after the field, so without reconciliation it would overwrite the
+    /// field's `FieldInfo`. The colliding method is bumped past the whole member
+    /// set; the field keeps its name, alias, and marker entry.
+    #[test]
+    fn colliding_instance_method_bumps_past_keyword_escaped_field() {
+        let mut pool: SymbolPool = HashMap::new();
+        let n = cg_name("user", &["lorem"], "Model");
+        pool.insert(
+            n.clone(),
+            Symbol::Class(Class {
+                generic_params: Vec::new(),
+                name: n,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("pass"),
+                    docstring: None,
+                    ty: int_ty(),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![method_func("pass_", &["self"], "x.baml", 100)],
+                origin: origin("x.baml", 0),
+            }),
+        );
+
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let py = &out[&PathBuf::from("lorem/__init__.py")];
+
+        // The field keeps its escaped name, alias, and marker entry.
+        assert!(
+            py.contains("    pass_: int = pydantic.Field(alias=\"pass\")"),
+            "field lost its alias or was clobbered:\n{py}"
+        );
+        assert!(
+            py.contains("__baml_wire_names__ = {\"pass_\": \"pass\"}"),
+            "wire-name marker missing:\n{py}"
+        );
+        // The colliding method's sync binding is bumped past the field.
+        assert!(
+            py.contains("    pass__       = _define_function("),
+            "colliding method was not bumped:\n{py}"
+        );
+        // The unbumped spelling that would clobber the field must be gone.
+        assert!(
+            !py.contains("    pass_       = _define_function("),
+            "method binding still clobbers the field:\n{py}"
+        );
+    }
+
+    /// The mirror pair: a plain field `pass_` and a keyword method `pass` (which
+    /// escapes to `pass_`). No field is keyword-escaped, so no marker is emitted;
+    /// a marker-gated reconciliation would miss this. The pass is collision-gated,
+    /// so the method still bumps past the field.
+    #[test]
+    fn keyword_method_bumps_past_plain_field_without_emitting_marker() {
+        let mut pool: SymbolPool = HashMap::new();
+        let n = cg_name("user", &["lorem"], "Model");
+        pool.insert(
+            n.clone(),
+            Symbol::Class(Class {
+                generic_params: Vec::new(),
+                name: n,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("pass_"),
+                    docstring: None,
+                    ty: int_ty(),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![method_func("pass", &["self"], "x.baml", 100)],
+                origin: origin("x.baml", 0),
+            }),
+        );
+
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let py = &out[&PathBuf::from("lorem/__init__.py")];
+
+        // The plain field stays a plain field: no alias, no marker.
+        assert!(
+            py.contains("    pass_: int\n"),
+            "plain field missing or altered:\n{py}"
+        );
+        assert!(
+            !py.contains("pydantic.Field(alias="),
+            "an alias was emitted for a non-escaped field:\n{py}"
+        );
+        assert!(
+            !py.contains("__baml_wire_names__"),
+            "a marker was emitted for a marker-free class:\n{py}"
+        );
+        // The keyword method escapes to `pass_`, collides, and bumps to `pass__`.
+        assert!(
+            py.contains("    pass__       = _define_function("),
+            "colliding method was not bumped:\n{py}"
+        );
+        assert!(
+            !py.contains("    pass_       = _define_function("),
+            "method binding still clobbers the field:\n{py}"
+        );
+    }
+
+    /// A static method collides the same way an instance method does. The bumped
+    /// binding keeps its `staticmethod(...)` wrap.
+    #[test]
+    fn colliding_static_method_bumps_past_keyword_escaped_field() {
+        let mut pool: SymbolPool = HashMap::new();
+        let n = cg_name("user", &["lorem"], "Model");
+        pool.insert(
+            n.clone(),
+            Symbol::Class(Class {
+                generic_params: Vec::new(),
+                name: n,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("pass"),
+                    docstring: None,
+                    ty: int_ty(),
+                }],
+                static_methods: vec![method_func("pass_", &[], "x.baml", 100)],
+                instance_methods: vec![],
+                origin: origin("x.baml", 0),
+            }),
+        );
+
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let py = &out[&PathBuf::from("lorem/__init__.py")];
+
+        assert!(
+            py.contains("    pass_: int = pydantic.Field(alias=\"pass\")"),
+            "field lost its alias or was clobbered:\n{py}"
+        );
+        assert!(
+            py.contains("__baml_wire_names__ = {\"pass_\": \"pass\"}"),
+            "wire-name marker missing:\n{py}"
+        );
+        assert!(
+            py.contains("    pass__       = staticmethod(_define_function("),
+            "colliding static method was not bumped:\n{py}"
+        );
+        assert!(
+            !py.contains("    pass_       = staticmethod("),
+            "static method binding still clobbers the field:\n{py}"
+        );
+    }
+
+    /// A collision with zero keywords involved: a field named `foo_async` collides
+    /// with the async fan-out binding of a method `foo` (whose async spelling is
+    /// `foo_async`). No keyword, no marker, so this proves the reconciliation is
+    /// gated on actual collisions rather than on keyword presence.
+    #[test]
+    fn keyword_free_async_binding_bumps_past_colliding_field() {
+        let mut pool: SymbolPool = HashMap::new();
+        let n = cg_name("user", &["lorem"], "Model");
+        pool.insert(
+            n.clone(),
+            Symbol::Class(Class {
+                generic_params: Vec::new(),
+                name: n,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("foo_async"),
+                    docstring: None,
+                    ty: int_ty(),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![method_func("foo", &["self"], "x.baml", 100)],
+                origin: origin("x.baml", 0),
+            }),
+        );
+
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let py = &out[&PathBuf::from("lorem/__init__.py")];
+
+        // The field is untouched and no marker is emitted (no keyword anywhere).
+        assert!(
+            py.contains("    foo_async: int\n"),
+            "field missing or altered:\n{py}"
+        );
+        assert!(
+            !py.contains("__baml_wire_names__"),
+            "a marker was emitted for a marker-free class:\n{py}"
+        );
+        // The sync binding does not collide and stays put.
+        assert!(
+            py.contains("    foo       = _define_function("),
+            "sync binding missing or renamed:\n{py}"
+        );
+        // The async binding collides with the field and is bumped.
+        assert!(
+            py.contains("    foo_async_ = _define_function("),
+            "colliding async binding was not bumped:\n{py}"
+        );
+        assert!(
+            !py.contains("    foo_async = _define_function("),
+            "async binding still clobbers the field:\n{py}"
+        );
+    }
+
+    /// A method must bump past both a colliding field and a sibling method whose
+    /// spelling the first bump would otherwise land on. The pre-seeded member set
+    /// makes the result order-independent: reversing the method order yields a
+    /// byte-identical leaf.
+    #[test]
+    fn colliding_method_bumps_past_field_and_sibling_method_spellings() {
+        fn build(reversed: bool) -> String {
+            let mut pool: SymbolPool = HashMap::new();
+            let n = cg_name("user", &["lorem"], "Model");
+            let mut methods = vec![
+                method_func("pass_", &["self"], "x.baml", 100),
+                method_func("pass__", &["self"], "x.baml", 101),
+            ];
+            if reversed {
+                methods.reverse();
+            }
+            pool.insert(
+                n.clone(),
+                Symbol::Class(Class {
+                    generic_params: Vec::new(),
+                    name: n,
+                    docstring: None,
+                    properties: vec![ClassProperty {
+                        name: BaseName::new("pass"),
+                        docstring: None,
+                        ty: int_ty(),
+                    }],
+                    static_methods: vec![],
+                    instance_methods: methods,
+                    origin: origin("x.baml", 0),
+                }),
+            );
+            to_source_code(&pool, &[], NamingConvention::PreserveCase)
+                [&PathBuf::from("lorem/__init__.py")]
+                .clone()
+        }
+
+        let py = build(false);
+
+        // Field keeps its escaped name, alias, and marker entry.
+        assert!(
+            py.contains("    pass_: int = pydantic.Field(alias=\"pass\")"),
+            "field lost its alias or was clobbered:\n{py}"
+        );
+        // Sibling method `pass__` does not collide with the field and stays put.
+        assert_eq!(
+            py.matches("    pass__       = ").count(),
+            1,
+            "unmoved sibling method binding should appear exactly once:\n{py}"
+        );
+        // Method `pass_` bumps past the field AND the sibling to `pass___`.
+        assert_eq!(
+            py.matches("    pass___       = ").count(),
+            1,
+            "twice-bumped method binding should appear exactly once:\n{py}"
+        );
+
+        // Reversing the source method order yields a byte-identical leaf.
+        let py_reversed = build(true);
+        assert_eq!(py, py_reversed);
+    }
+
+    /// A keyword-escaped field alongside a method that does NOT collide must leave
+    /// the non-colliding method untouched: the reconciliation moves only actual
+    /// colliders, not every member of a keyword-bearing class.
+    #[test]
+    fn keyword_field_with_non_colliding_method_stays_byte_identical() {
+        let mut pool: SymbolPool = HashMap::new();
+        let n = cg_name("user", &["lorem"], "Model");
+        pool.insert(
+            n.clone(),
+            Symbol::Class(Class {
+                generic_params: Vec::new(),
+                name: n,
+                docstring: None,
+                properties: vec![ClassProperty {
+                    name: BaseName::new("pass"),
+                    docstring: None,
+                    ty: int_ty(),
+                }],
+                static_methods: vec![],
+                instance_methods: vec![method_func("bar", &["self"], "x.baml", 100)],
+                origin: origin("x.baml", 0),
+            }),
+        );
+
+        let out = to_source_code(&pool, &[], NamingConvention::PreserveCase);
+        let py = &out[&PathBuf::from("lorem/__init__.py")];
+
+        assert!(
+            py.contains("    __baml_wire_names__ = {\"pass_\": \"pass\"}\n"),
+            "marker missing:\n{py}"
+        );
+        assert!(
+            py.contains("    pass_: int = pydantic.Field(alias=\"pass\")\n"),
+            "field missing:\n{py}"
+        );
+        assert!(
+            py.contains("    bar       = _define_function("),
+            "non-colliding sync binding missing:\n{py}"
+        );
+        assert!(
+            py.contains("    bar_async = _define_function("),
+            "non-colliding async binding missing:\n{py}"
+        );
+        // The non-colliding method is not bumped, and no double-underscore field
+        // spelling is invented.
+        assert!(
+            !py.contains("    bar_       = "),
+            "a non-colliding method was bumped:\n{py}"
+        );
+        assert!(
+            !py.contains("pass__"),
+            "the field was moved when it should not have been:\n{py}"
+        );
+    }
+
     #[test]
     fn field_collision_pass_and_pass_underscore_diverge() {
         let mut pool: SymbolPool = HashMap::new();

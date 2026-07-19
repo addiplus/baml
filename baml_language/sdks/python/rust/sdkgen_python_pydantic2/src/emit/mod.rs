@@ -108,12 +108,15 @@ pub(crate) fn build_emitted(pool: &SymbolPool) -> Vec<(LeafPath, EmittedSymbol, 
                     expand_methods(&c.static_methods, &class_fqn_root, MethodKind::Static);
                 let mut instance_methods =
                     expand_methods(&c.instance_methods, &class_fqn_root, MethodKind::Instance);
-                // Reserve the `__baml_wire_names__` marker name across the
-                // combined field+method member set when the marker will be
-                // emitted, so a user member of that name is bumped rather than
-                // clobbering the marker dict at class creation. Keyword-free
-                // classes emit no marker, so this is a no-op for them.
-                reserve_class_wire_marker(
+                // Reconcile the class's combined field + method namespace:
+                // methods whose escaped/fan-out spelling lands on a field (or
+                // on the emitted `__baml_wire_names__` marker) are bumped past
+                // the whole member set, so no later class-body binding can
+                // clobber an earlier one. Fields never move (their alias/marker
+                // wire identity is already final), except the pre-existing
+                // marker-token projection arm. Collision-free classes bump
+                // nothing and stay byte-identical.
+                resolve_class_member_collisions(
                     &mut properties,
                     &mut static_methods,
                     &mut instance_methods,
@@ -512,59 +515,86 @@ fn project_field_off_marker(reserved: &mut std::collections::HashSet<String>) ->
     candidate
 }
 
-/// Reserve the `__baml_wire_names__` marker identifier across a class's combined
-/// field + method member namespace, but ONLY when the marker will actually be
-/// emitted (>= 1 field carries an `alias`, i.e. was keyword-escaped). A METHOD
-/// whose emitted name equals the marker is bumped one trailing underscore past it
-/// (it renders as a bare class-body assignment, so leading underscores are fine).
-/// A FIELD named like the marker is instead projected onto a leading-underscore-
-/// free spelling by [`project_field_off_marker`], because pydantic refuses a model
-/// field whose name starts with `_` (a plain trailing-underscore bump would still
-/// lead with `__` and crash `import` at class creation); it records
-/// `alias = "__baml_wire_names__"` so the marker still lists it and its raw wire
-/// identity is preserved. Keyword-free classes emit no marker, so nothing is
-/// reserved and their output stays byte-identical (the digest gate enforces this).
-fn reserve_class_wire_marker(
+/// Reconcile a class's combined field + method member namespace so that no two
+/// members share a final Python spelling.
+///
+/// Field names, method names, and the `_async` fan-out suffix are escaped in three
+/// independent passes that do not share a used-set: fields go through the
+/// collision-aware [`escape_keywords_in_scope`] (call site `emit/mod.rs:86`),
+/// methods through the stateless [`escape_python_keyword`] on the bare and
+/// `{bare}_async` spellings (`expand_methods`), so two distinct raw member names
+/// can converge on one identifier — a keyword field `pass` and a method `pass_`, a
+/// plain field `pass_` and a keyword method `pass`, or even a keyword-free field
+/// `foo_async` and the async binding of a method `foo`. Because methods render
+/// after fields in the class body, the later binding would clobber the earlier
+/// member (a method assignment overwrites a field's `pydantic.FieldInfo`, losing
+/// the alias and destroying the declared method).
+///
+/// Policy is field-first: fields carry the alias / `__baml_wire_names__` marker
+/// wire contract and never move, so a colliding method's rendered name is the one
+/// that is bumped past the whole member set with the trailing-underscore rule. A
+/// method LHS bump has no wire effect, because the runtime FQN is built from the
+/// raw `Name` (`expand_methods`) and methods are not serialized. The one field
+/// that may move is the pre-existing marker-token arm: a field literally named
+/// `__baml_wire_names__` is projected onto a leading-underscore-free spelling (a
+/// plain field may not lead with `_`, pydantic raises at class creation) and keeps
+/// its raw name through its alias and the marker entry.
+///
+/// The used-set is pre-seeded with the FULL member namespace before any bump, so a
+/// bump can never land on an existing member's spelling and the outcome is
+/// independent of member order. The pass is gated on actual collisions, not on
+/// keyword presence, so the marker-free mirror and async fan-out cases are covered.
+/// It is a structural no-op for a class whose members do not collide: names are
+/// reserved but nothing is bumped, so the byte-identity invariant tightens from
+/// "keyword-free implies byte-identical" to "keyword-free AND collision-free
+/// implies byte-identical" (the digest gate enforces this).
+fn resolve_class_member_collisions(
     properties: &mut [PyClassProperty],
     static_methods: &mut [PyMethodBinding],
     instance_methods: &mut [PyMethodBinding],
 ) {
     let marker_emitted = properties.iter().any(|p| p.alias.is_some());
-    if !marker_emitted {
-        return;
-    }
-    // Reserve every member name that is NOT itself the marker token (those keep
-    // their spelling), plus the marker token (the marker occupies it). Bumps
-    // search past this set.
-    let mut reserved: std::collections::HashSet<String> = properties
-        .iter()
-        .map(|p| p.name.clone())
-        .chain(static_methods.iter().map(|m| m.py_name.clone()))
-        .chain(instance_methods.iter().map(|m| m.py_name.clone()))
-        .filter(|n| n != WIRE_NAMES_MARKER)
-        .collect();
-    reserved.insert(WIRE_NAMES_MARKER.to_string());
 
-    for p in properties.iter_mut() {
-        if p.name == WIRE_NAMES_MARKER {
-            // Fields must not lead with `_` (pydantic raises at class creation),
-            // so project off the marker to a legal spelling rather than the plain
-            // trailing-underscore bump the method arm uses.
-            p.name = project_field_off_marker(&mut reserved);
-            // Preserve the raw wire key: the marker now maps projected-attr -> raw.
-            if p.alias.is_none() {
-                p.alias = Some(WIRE_NAMES_MARKER.to_string());
+    let field_names: std::collections::HashSet<String> =
+        properties.iter().map(|p| p.name.clone()).collect();
+
+    // Pre-seed the used-set with every member's final spelling (plus the marker
+    // token when it is emitted). Seeding everything up front makes a bump unable
+    // to land on any existing member and makes the result order-independent.
+    let mut reserved: std::collections::HashSet<String> = field_names.clone();
+    reserved.extend(static_methods.iter().map(|m| m.py_name.clone()));
+    reserved.extend(instance_methods.iter().map(|m| m.py_name.clone()));
+    if marker_emitted {
+        reserved.insert(WIRE_NAMES_MARKER.to_string());
+    }
+
+    // The only field that ever moves: one literally named like the marker. It is
+    // projected onto a pydantic-legal spelling and keeps its raw name through its
+    // alias and the marker entry.
+    if marker_emitted {
+        for p in properties.iter_mut() {
+            if p.name == WIRE_NAMES_MARKER {
+                p.name = project_field_off_marker(&mut reserved);
+                if p.alias.is_none() {
+                    p.alias = Some(WIRE_NAMES_MARKER.to_string());
+                }
             }
         }
     }
+
+    // Statics render before instance methods; each vec is already origin-then-name
+    // sorted with sync before async. A binding collides when its name lands on a
+    // field or on the emitted marker; colliders are bumped past the whole set.
     for m in static_methods.iter_mut().chain(instance_methods.iter_mut()) {
-        if m.py_name == WIRE_NAMES_MARKER {
-            m.py_name = bump_past_reserved(WIRE_NAMES_MARKER, &mut reserved);
+        let collides_with_field = field_names.contains(&m.py_name);
+        let collides_with_marker = marker_emitted && m.py_name == WIRE_NAMES_MARKER;
+        if collides_with_field || collides_with_marker {
+            m.py_name = bump_past_reserved(&m.py_name, &mut reserved);
         }
     }
 }
 
-/// Enum counterpart of [`reserve_class_wire_marker`]. BAML enums have no methods,
+/// Enum counterpart of [`resolve_class_member_collisions`]. BAML enums have no methods,
 /// so the only collision vector is a member literally named `__baml_wire_values__`;
 /// reserve the marker across the member idents whenever the enum marker is emitted
 /// (>= 1 escaped member). A bumped member records its raw wire name into the marker.
