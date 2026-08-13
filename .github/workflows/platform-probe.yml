@@ -1,0 +1,442 @@
+# Platform probe for PR #4070 (reserved_keywords fixture).
+#
+# Scratch-branch only. Trigger is a push to `ci/platform-probe-0813`; this file
+# must never land on `fix/python-reserved-keywords` or on the default branch.
+#
+# Deliberate differences from upstream's cargo-tests.reusable.yaml:
+#   - plain GitHub-hosted labels, NOT blacksmith-* (the fork has no Blacksmith).
+#   - no mise, no direnv, no sccache, no .envrc. Those are the paths that need
+#     BAML_SCCACHE_R2_* and that drag in `npm:@infisical/cli`. Zero secrets are
+#     referenced anywhere in this file.
+#   - toolchain comes from `rustup show` reading rust-toolchain.toml (1.93.0),
+#     exactly as upstream does; cargo-nextest and wasm-pack come from
+#     taiki-e/install-action (upstream's own pre-mise mechanism).
+#   - every test step swallows its exit code into probe-out/exit/<name>.txt and
+#     always exits 0, so one failing cell can never cancel the rest of the leg.
+#     Nothing in this workflow reports pass/fail; it only records exit codes.
+
+name: platform probe
+
+on:
+  push:
+    branches:
+      - ci/platform-probe-0813
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  # The workspace depends on large git forks (minijinja, aws-sdk-rust,
+  # google-cloud-rust). Shelling out to git is far faster and far less
+  # memory-hungry than cargo's built-in fetcher on those.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Upstream's own runtime/disk tuning, copied verbatim in intent.
+  CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+  CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+  CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+  RUST_BACKTRACE: "1"
+  BAML_TELEMETRY_ENV: internal
+
+jobs:
+  probe:
+    name: "probe (${{ matrix.label }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos
+            os: macos-latest
+            pkgs: "-p sdk_test_swift -p sdk_test_cpp -p sdk_test_typescript -p sdk_test_typescript_web -p sdk_test_rust"
+          - label: windows
+            os: windows-latest
+            pkgs: "-p sdk_test_swift -p sdk_test_typescript -p sdk_test_typescript_web -p sdk_test_rust -p sdk_test_python_pydantic2 -p sdk_test_cpp"
+          - label: ubuntu
+            os: ubuntu-latest
+            pkgs: "-p sdk_test_swift -p sdk_test_cpp -p sdk_test_typescript -p sdk_test_typescript_web -p sdk_test_rust -p sdk_test_python_pydantic2"
+    runs-on: ${{ matrix.os }}
+    # Outer bound (GitHub's per-job maximum). Every step below carries its own
+    # timeout, so a hang costs that step's budget, not the job's. The sum of the
+    # step timeouts is 330 (macos), 325 (windows), 330 (ubuntu), which fits under
+    # this with ~30 min of room for checkout, cache restore and the three uploads.
+    # A step that hits its own timeout writes NO exit file: a missing entry in
+    # the summary means "timed out or skipped", never "passed".
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: "Record runner identity"
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set +e
+          mkdir -p probe-out/exit probe-out/log
+          {
+            echo "matrix-label:    ${{ matrix.label }}"
+            echo "runs-on:         ${{ matrix.os }}"
+            echo "RUNNER_OS:       ${RUNNER_OS}"
+            echo "RUNNER_ARCH:     ${RUNNER_ARCH}"
+            echo "ImageOS:         ${ImageOS}"
+            echo "ImageVersion:    ${ImageVersion}"
+            echo "uname -m:        $(uname -m)"
+            echo "uname -s:        $(uname -s)"
+            echo "uname -a:        $(uname -a)"
+          } > probe-out/platform.txt
+          case "${RUNNER_OS}" in
+            macOS)
+              sw_vers >> probe-out/platform.txt
+              echo "xcode: $(xcodebuild -version 2>&1 | tr '\n' ' ')" >> probe-out/platform.txt
+              echo "swift: $(swift --version 2>&1 | tr '\n' ' ')" >> probe-out/platform.txt
+              echo "cmake: $(cmake --version 2>&1 | head -1)" >> probe-out/platform.txt
+              ;;
+            Linux)
+              cat /etc/os-release >> probe-out/platform.txt
+              echo "cmake: $(cmake --version 2>&1 | head -1)" >> probe-out/platform.txt
+              echo "gcc:   $(gcc --version 2>&1 | head -1)" >> probe-out/platform.txt
+              ;;
+            Windows)
+              cmd //c ver >> probe-out/platform.txt
+              echo "PROCESSOR_ARCHITECTURE: ${PROCESSOR_ARCHITECTURE}" >> probe-out/platform.txt
+              echo "cmake: $(cmake --version 2>&1 | head -1)" >> probe-out/platform.txt
+              echo "bash:  $(bash --version 2>&1 | head -1)" >> probe-out/platform.txt
+              ;;
+          esac
+          cat probe-out/platform.txt
+          exit 0
+
+      - name: "Install pinned Rust toolchain (rust-toolchain.toml)"
+        working-directory: baml_language
+        timeout-minutes: 15
+        run: |
+          for attempt in 1 2 3; do
+            if rustup show; then break; fi
+            echo "rustup show attempt ${attempt} failed; retrying"
+            if [ "${attempt}" = 3 ]; then
+              echo "::error::rustup show failed after 3 attempts"
+              exit 1
+            fi
+            sleep 15
+          done
+          {
+            echo "--- rust toolchain ---"
+            rustup show active-toolchain
+            rustc -vV
+            cargo -V
+          } >> ../probe-out/platform.txt
+          cat ../probe-out/platform.txt
+
+      - name: "Install cargo-nextest and wasm-pack"
+        uses: taiki-e/install-action@v2
+        timeout-minutes: 10
+        with:
+          tool: cargo-nextest,wasm-pack
+
+      - name: "Install pnpm via npm (no corepack, no registry auth)"
+        if: always()
+        timeout-minutes: 10
+        run: |
+          set +e
+          {
+            echo "--- node/pnpm ---"
+            echo "node: $(node -v 2>&1)"
+            echo "npm:  $(npm -v 2>&1)"
+          } >> probe-out/platform.txt
+          npm install -g pnpm@9.12.0
+          code=$?
+          echo "pnpm: $(pnpm -v 2>&1)" >> probe-out/platform.txt
+          echo "${code}" > probe-out/exit/install-pnpm.txt
+          cat probe-out/platform.txt
+          exit 0
+
+      - name: "Install uv (astral official installer, no auth)"
+        if: always()
+        timeout-minutes: 10
+        run: |
+          set +e
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
+            code=$?
+            echo "${USERPROFILE}\.local\bin" >> "$GITHUB_PATH"
+          else
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            code=$?
+            echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+          fi
+          echo "${code}" > probe-out/exit/install-uv.txt
+          exit 0
+
+      - name: "Restore/save cargo cache"
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "baml_language -> target"
+          cache-all-crates: true
+          cache-on-failure: true
+          shared-key: "probe-${{ matrix.label }}"
+
+      - name: "Fetch cargo dependencies"
+        if: always()
+        working-directory: baml_language
+        timeout-minutes: 25
+        run: |
+          set +e
+          mkdir -p ../probe-out/exit ../probe-out/log
+          cargo fetch 2>&1 | tee ../probe-out/log/fetch.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/fetch.txt
+          echo "fetch exit=${code}"
+          exit 0
+
+      # This step runs every selected sdk_test crate's build.rs, which is where
+      # codegen happens. Even if the test-binary link later fails, the generated
+      # SDK source for the reserved_keywords fixture exists on disk after this,
+      # and the next step uploads it. That artifact is the highest-value output
+      # of the whole run.
+      - name: "Build sdk-test crates (runs build.rs codegen)"
+        if: always()
+        working-directory: baml_language
+        timeout-minutes: 85
+        run: |
+          set +e
+          cargo test --no-run --all-features ${{ matrix.pkgs }} 2>&1 | tee ../probe-out/log/codegen.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/codegen.txt
+          echo "codegen exit=${code}"
+          exit 0
+
+      - name: "Inspect generated reserved_keywords sources"
+        if: always()
+        working-directory: baml_language
+        timeout-minutes: 5
+        run: |
+          set +e
+          {
+            for d in sdk_tests/crates/*/reserved_keywords/generated; do
+              [ -d "${d}" ] || continue
+              echo "=== ${d} ==="
+              find "${d}" -type f \
+                -not -path '*/node_modules/*' \
+                -not -path '*/.venv/*' \
+                -not -path '*/.build/*' | sort
+            done
+          } | tee ../probe-out/log/generated-tree.txt
+          echo "--- swift generated sources: occurrences of 'async' ---" \
+            | tee ../probe-out/log/swift-async-grep.txt
+          grep -rn --binary-files=without-match -e 'async' \
+            sdk_tests/crates/swift/reserved_keywords/generated \
+            2>/dev/null | head -200 | tee -a ../probe-out/log/swift-async-grep.txt
+          echo "--- build_diagnostics.txt files ---" \
+            | tee ../probe-out/log/build-diagnostics.txt
+          for f in target/debug/build/sdk_test_*/out/build_diagnostics.txt; do
+            [ -f "${f}" ] || continue
+            echo "=== ${f} ===" | tee -a ../probe-out/log/build-diagnostics.txt
+            cat "${f}" | tee -a ../probe-out/log/build-diagnostics.txt
+          done
+          exit 0
+
+      - name: "Upload generated sources (pre-test)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: generated-pretest-${{ matrix.label }}
+          path: |
+            probe-out/**
+            baml_language/sdk_tests/crates/*/reserved_keywords/generated/**
+            baml_language/target/debug/build/sdk_test_*/out/build_diagnostics.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ---- Priority 1: Swift. macOS is Swift's only CI leg and the
+      # reserved_keywords fixture has never run against it. Note the fixture is
+      # NOT in ENFORCED_FIXTURES in harness_setup/src/swift.rs, so its test is
+      # emitted `#[ignore]`d; `--run-ignored all` is what makes it execute.
+      - name: "swift: build_diagnostics (codegen soft-failures)"
+        if: always()
+        continue-on-error: true
+        working-directory: baml_language
+        timeout-minutes: 15
+        run: |
+          set +e
+          cargo nextest run -p sdk_test_swift --all-features --no-fail-fast \
+            -E 'package(=sdk_test_swift) and test(build_diagnostics)' \
+            2>&1 | tee ../probe-out/log/swift-diagnostics.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/swift-diagnostics.txt
+          echo "swift-diagnostics exit=${code}"
+          exit 0
+
+      - name: "swift: reserved_keywords (macOS only, --run-ignored all)"
+        if: always() && matrix.label == 'macos'
+        continue-on-error: true
+        working-directory: baml_language
+        timeout-minutes: 30
+        run: |
+          set +e
+          cargo nextest run -p sdk_test_swift --all-features --no-fail-fast \
+            --run-ignored all \
+            -E 'package(=sdk_test_swift) and test(reserved_keywords)' \
+            2>&1 | tee ../probe-out/log/swift-reserved-keywords.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/swift-reserved-keywords.txt
+          echo "swift-reserved-keywords exit=${code}"
+          exit 0
+
+      - name: "Upload interim output (after swift)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: probe-interim-swift-${{ matrix.label }}
+          path: |
+            probe-out/**
+            baml_language/sdk_tests/crates/swift/reserved_keywords/generated/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ---- C++ (macOS + ubuntu). Windows gets a separate best-effort step at
+      # the very end: upstream's own matrix excludes cpp on Windows because the
+      # fixture driver is bash + POSIX cmake.
+      - name: "cpp: reserved_keywords"
+        if: always() && matrix.label != 'windows'
+        continue-on-error: true
+        working-directory: baml_language
+        timeout-minutes: 30
+        run: |
+          set +e
+          cargo nextest run -p sdk_test_cpp --all-features --no-fail-fast \
+            -E 'package(=sdk_test_cpp) and test(reserved_keywords)' \
+            2>&1 | tee ../probe-out/log/cpp.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/cpp.txt
+          echo "cpp exit=${code}"
+          exit 0
+
+      - name: "typescript: reserved_keywords"
+        if: always()
+        continue-on-error: true
+        working-directory: baml_language
+        timeout-minutes: 35
+        run: |
+          set +e
+          cargo nextest run -p sdk_test_typescript --all-features --no-fail-fast \
+            -E 'package(=sdk_test_typescript) and test(reserved_keywords)' \
+            2>&1 | tee ../probe-out/log/typescript.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/typescript.txt
+          echo "typescript exit=${code}"
+          exit 0
+
+      - name: "typescript_web: reserved_keywords"
+        if: always()
+        continue-on-error: true
+        working-directory: baml_language
+        timeout-minutes: 25
+        run: |
+          set +e
+          cargo nextest run -p sdk_test_typescript_web --all-features --no-fail-fast \
+            -E 'package(=sdk_test_typescript_web) and test(reserved_keywords)' \
+            2>&1 | tee ../probe-out/log/typescript-web.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/typescript-web.txt
+          echo "typescript-web exit=${code}"
+          exit 0
+
+      - name: "rust: reserved_keywords"
+        if: always()
+        continue-on-error: true
+        working-directory: baml_language
+        timeout-minutes: 25
+        run: |
+          set +e
+          cargo nextest run -p sdk_test_rust --all-features --no-fail-fast \
+            -E 'package(=sdk_test_rust) and test(reserved_keywords)' \
+            2>&1 | tee ../probe-out/log/rust.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/rust.txt
+          echo "rust exit=${code}"
+          exit 0
+
+      - name: "python_pydantic2: reserved_keywords"
+        if: always() && matrix.label != 'macos'
+        continue-on-error: true
+        working-directory: baml_language
+        timeout-minutes: 30
+        run: |
+          set +e
+          cargo nextest run -p sdk_test_python_pydantic2 --all-features --no-fail-fast \
+            -E 'package(=sdk_test_python_pydantic2) and test(reserved_keywords)' \
+            2>&1 | tee ../probe-out/log/python-pydantic2.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/python-pydantic2.txt
+          echo "python-pydantic2 exit=${code}"
+          exit 0
+
+      # Last, and expected to fail on infrastructure grounds. Upstream has no
+      # Windows cpp entry: sdk_tests/crates/cpp fixtures drive `bash test.sh`,
+      # and the comment in cargo-tests.reusable.yaml says Windows joins "once the
+      # MSVC test driver lands". A nonzero exit here is STILL-UNVERIFIED, not a
+      # C++ result.
+      - name: "cpp on windows (best effort, expected infra failure)"
+        if: always() && matrix.label == 'windows'
+        continue-on-error: true
+        working-directory: baml_language
+        timeout-minutes: 25
+        run: |
+          set +e
+          cargo nextest run -p sdk_test_cpp --all-features --no-fail-fast \
+            -E 'package(=sdk_test_cpp) and test(reserved_keywords)' \
+            2>&1 | tee ../probe-out/log/cpp-windows.log
+          code=${PIPESTATUS[0]}
+          echo "${code}" > ../probe-out/exit/cpp-windows.txt
+          echo "cpp-windows exit=${code}"
+          exit 0
+
+      - name: "Exit codes (read back from files)"
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set +e
+          {
+            echo "### probe (${{ matrix.label }} / ${{ matrix.os }})"
+            echo ""
+            echo '```'
+            for f in probe-out/exit/*.txt; do
+              [ -f "${f}" ] || continue
+              name="$(basename "${f}" .txt)"
+              printf '%-28s %s\n' "${name}" "$(cat "${f}")"
+            done
+            echo '```'
+            echo ""
+            echo '```'
+            cat probe-out/platform.txt
+            echo '```'
+          } | tee probe-out/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          cat probe-out/SUMMARY.md
+          exit 0
+
+      - name: "Upload probe output (post-test)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: probe-posttest-${{ matrix.label }}
+          path: |
+            probe-out/**
+            baml_language/sdk_tests/crates/*/reserved_keywords/generated/**
+            baml_language/target/nextest/**
+            baml_language/target/debug/build/sdk_test_*/out/build_diagnostics.txt
+            !baml_language/sdk_tests/crates/*/reserved_keywords/generated/**/node_modules/**
+            !baml_language/sdk_tests/crates/*/reserved_keywords/generated/**/target/**
+          if-no-files-found: warn
+          retention-days: 14
