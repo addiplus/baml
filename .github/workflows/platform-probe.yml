@@ -14,6 +14,25 @@
 #   - every test step swallows its exit code into probe-out/exit/<name>.txt and
 #     always exits 0, so one failing cell can never cancel the rest of the leg.
 #     Nothing in this workflow reports pass/fail; it only records exit codes.
+#
+# Revision 2 (2026-08-14) closes the two coverage gaps left by run 31695117485:
+#   1. macOS python_pydantic2. Revision 1 dropped it for time budget, but
+#      upstream's own matrix DOES schedule python-pydantic2 on macos, so this
+#      was the one genuine gap against what upstream CI will run. Measured wall
+#      time for that job in run 31695117485 was 34.8 min against a 360 min cap,
+#      so the budget reason no longer holds.
+#   2. Windows C++. The cell died in 0.24s in run 31695117485 because the
+#      fixture driver is spawned as a bare `Command::new("bash")` from
+#      sdk_tests/harness_runner, which inherits the machine PATH, and
+#      C:\Windows\System32\bash.exe (the WSL launcher) sits ahead of Git Bash
+#      there. windows-latest has no WSL distribution installed, so that bash
+#      exits immediately. Revision 2 locates a real Git Bash on the runner
+#      (it does not assume the path), records what it found, and puts that
+#      directory first on PATH for the C++ step only.
+#      Note the fixture driver already anticipates Git Bash: its `uname -s`
+#      case arm matches MSYS*/MINGW*/CYGWIN* and picks bridge_cffi.dll.
+#      Windows C++ is still a BONUS, not a gap: upstream's matrix has no cpp
+#      cell on windows at all.
 
 name: platform probe
 
@@ -59,7 +78,7 @@ jobs:
         include:
           - label: macos
             os: macos-latest
-            pkgs: "-p sdk_test_swift -p sdk_test_cpp -p sdk_test_typescript -p sdk_test_typescript_web -p sdk_test_rust"
+            pkgs: "-p sdk_test_swift -p sdk_test_cpp -p sdk_test_typescript -p sdk_test_typescript_web -p sdk_test_rust -p sdk_test_python_pydantic2"
           - label: windows
             os: windows-latest
             pkgs: "-p sdk_test_swift -p sdk_test_typescript -p sdk_test_typescript_web -p sdk_test_rust -p sdk_test_python_pydantic2 -p sdk_test_cpp"
@@ -67,10 +86,22 @@ jobs:
             os: ubuntu-latest
             pkgs: "-p sdk_test_swift -p sdk_test_cpp -p sdk_test_typescript -p sdk_test_typescript_web -p sdk_test_rust -p sdk_test_python_pydantic2"
     runs-on: ${{ matrix.os }}
-    # Outer bound (GitHub's per-job maximum). Every step below carries its own
-    # timeout, so a hang costs that step's budget, not the job's. The sum of the
-    # step timeouts is 330 (macos), 325 (windows), 330 (ubuntu), which fits under
-    # this with ~30 min of room for checkout, cache restore and the three uploads.
+    # Outer bound (GitHub's per-job maximum for hosted runners; 360 cannot be
+    # raised). Every step below carries its own timeout, so a hang costs that
+    # step's budget, not the job's.
+    #
+    # Nominal worst case (sum of per-step caps) after revision 2:
+    #   macos   355  (was 330; +25 for the python cell)
+    #   windows 340  (was 325; +5 bash-locate, +15 cpp raised 25 -> 40)
+    #   ubuntu  325  (was 330; -5 because the python cap dropped 30 -> 25)
+    # Those are caps that would all have to be hit at once. Measured wall time
+    # in run 31695117485, on a completely cold cache (that run was the only run
+    # this fork has ever had), was macos 34.8, windows 56.6, ubuntu 36.3 min.
+    # The python cap is 25 because the two legs that actually ran it measured
+    # 9.2 min (ubuntu) and 8.2 min (windows). The Windows cpp cap is 40 because
+    # revision 1 never got past `bash`, so that cell has no measurement at all
+    # and it has to configure and build protobuf + abseil + the SDK under MSVC.
+    #
     # A step that hits its own timeout writes NO exit file: a missing entry in
     # the summary means "timed out or skipped", never "passed".
     timeout-minutes: 360
@@ -116,6 +147,70 @@ jobs:
               ;;
           esac
           cat probe-out/platform.txt
+          exit 0
+
+      # Windows only. Find out, rather than assume, which `bash` a NATIVE child
+      # process would get. `shell: bash` already gives THIS step Git Bash, but
+      # sdk_tests/harness_runner spawns `Command::new("bash")`, and that goes
+      # through CreateProcess against the machine PATH, where
+      # C:\Windows\System32\bash.exe (WSL) normally wins. This step records the
+      # full resolution order and exports the Git Bash directory in MSYS form
+      # (/c/Program Files/Git/bin, never C:/... which would be ambiguous inside
+      # a colon-separated PATH) for the C++ step to prepend. If no Git Bash is
+      # found it exports nothing and says so; nothing downstream is faked.
+      - name: "windows: locate Git Bash (verify, do not assume)"
+        if: always() && matrix.label == 'windows'
+        timeout-minutes: 5
+        run: |
+          set +e
+          mkdir -p probe-out/exit probe-out/log
+          out=probe-out/log/windows-bash-resolution.txt
+          {
+            echo "--- where.exe bash (machine PATH order, what CreateProcess sees) ---"
+            where.exe bash 2>&1
+            echo ""
+            echo "--- where.exe sh ---"
+            where.exe sh 2>&1
+            echo ""
+            echo "--- candidate Git Bash locations ---"
+            for c in "/c/Program Files/Git/bin" \
+                     "/c/Program Files/Git/usr/bin" \
+                     "/c/Program Files (x86)/Git/bin"; do
+              if [ -f "${c}/bash.exe" ]; then
+                echo "PRESENT  ${c}/bash.exe"
+                echo "         $("${c}/bash.exe" --version 2>&1 | head -1)"
+              else
+                echo "ABSENT   ${c}/bash.exe"
+              fi
+            done
+            echo ""
+            echo "--- WSL launcher ---"
+            if [ -f "/c/Windows/System32/bash.exe" ]; then
+              echo "PRESENT  C:/Windows/System32/bash.exe (WSL launcher)"
+            else
+              echo "ABSENT   C:/Windows/System32/bash.exe"
+            fi
+            echo ""
+            echo "--- this step's own shell ---"
+            echo "BASH=${BASH}"
+            echo "uname -s=$(uname -s)"
+          } > "${out}" 2>&1
+          cat "${out}"
+
+          gitbash=""
+          for c in "/c/Program Files/Git/bin" \
+                   "/c/Program Files/Git/usr/bin" \
+                   "/c/Program Files (x86)/Git/bin"; do
+            if [ -f "${c}/bash.exe" ]; then gitbash="${c}"; break; fi
+          done
+          if [ -n "${gitbash}" ]; then
+            echo "GIT_BASH_DIR=${gitbash}" >> "$GITHUB_ENV"
+            echo "resolved GIT_BASH_DIR=${gitbash}" | tee -a "${out}"
+            echo "0" > probe-out/exit/windows-bash-locate.txt
+          else
+            echo "no Git Bash found at any candidate path" | tee -a "${out}"
+            echo "1" > probe-out/exit/windows-bash-locate.txt
+          fi
           exit 0
 
       - name: "Install pinned Rust toolchain (rust-toolchain.toml)"
@@ -368,11 +463,13 @@ jobs:
           echo "rust exit=${code}"
           exit 0
 
+      # All three legs as of revision 2. macOS was the one genuine gap against
+      # upstream's matrix, which does schedule python-pydantic2 on macos.
       - name: "python_pydantic2: reserved_keywords"
-        if: always() && matrix.label != 'macos'
+        if: always()
         continue-on-error: true
         working-directory: baml_language
-        timeout-minutes: 30
+        timeout-minutes: 25
         run: |
           set +e
           cargo nextest run -p sdk_test_python_pydantic2 --all-features --no-fail-fast \
@@ -383,24 +480,58 @@ jobs:
           echo "python-pydantic2 exit=${code}"
           exit 0
 
-      # Last, and expected to fail on infrastructure grounds. Upstream has no
-      # Windows cpp entry: sdk_tests/crates/cpp fixtures drive `bash test.sh`,
-      # and the comment in cargo-tests.reusable.yaml says Windows joins "once the
-      # MSVC test driver lands". A nonzero exit here is STILL-UNVERIFIED, not a
-      # C++ result.
-      - name: "cpp on windows (best effort, expected infra failure)"
+      # Last, and still a BONUS rather than a gap: upstream has no Windows cpp
+      # entry at all, and the comment in cargo-tests.reusable.yaml says Windows
+      # joins "once the MSVC test driver lands". Revision 1 never reached C++
+      # here; it died in 0.24s because `bash` resolved to the WSL launcher on a
+      # runner with no WSL distribution. Revision 2 puts the verified Git Bash
+      # directory first on PATH so `bash test.sh` reaches a real shell.
+      #
+      # Two things could still fail for reasons that are NOT our patch, and the
+      # extra logs below exist to tell them apart:
+      #   - `compile` needs cmake + MSVC to build protobuf, abseil and the SDK.
+      #   - `run` execs "$BUILD_DIR/build/fixture_tests", a single-config path.
+      #     The default generator on windows-latest is Visual Studio, which is
+      #     multi-config and writes build/Debug/fixture_tests.exe instead. That
+      #     is a fixture-driver limitation, not a codegen result.
+      # A nonzero exit here is STILL-UNVERIFIED unless the log shows a real
+      # compiler or test-assertion error.
+      - name: "cpp on windows (Git Bash first on PATH; bonus, not a gap)"
         if: always() && matrix.label == 'windows'
         continue-on-error: true
         working-directory: baml_language
-        timeout-minutes: 25
+        timeout-minutes: 40
         run: |
           set +e
+          mkdir -p ../probe-out/exit ../probe-out/log
+          if [ -n "${GIT_BASH_DIR:-}" ]; then
+            export PATH="${GIT_BASH_DIR}:${PATH}"
+          fi
+          {
+            echo "GIT_BASH_DIR=${GIT_BASH_DIR:-<unset>}"
+            echo "--- where.exe bash AFTER the prepend (what cargo's child sees) ---"
+            where.exe bash 2>&1
+            echo "--- version of the winner ---"
+            bash --version 2>&1 | head -1
+          } | tee ../probe-out/log/cpp-windows-bash.txt
+
           cargo nextest run -p sdk_test_cpp --all-features --no-fail-fast \
             -E 'package(=sdk_test_cpp) and test(reserved_keywords)' \
             2>&1 | tee ../probe-out/log/cpp-windows.log
           code=${PIPESTATUS[0]}
           echo "${code}" > ../probe-out/exit/cpp-windows.txt
           echo "cpp-windows exit=${code}"
+
+          # cmake's own logs, whatever happened, so a compiler error can be told
+          # apart from a missing-shell or wrong-output-path error.
+          for f in target/cpp-fixture-builds/reserved_keywords-*/configure.log \
+                   target/cpp-fixture-builds/reserved_keywords-*/build.log; do
+            [ -f "${f}" ] || continue
+            echo "=== ${f} ===" >> ../probe-out/log/cpp-windows-cmake.log
+            cat "${f}" >> ../probe-out/log/cpp-windows-cmake.log
+          done
+          find target/cpp-fixture-builds -maxdepth 4 2>/dev/null | sort | head -400 \
+            > ../probe-out/log/cpp-windows-buildtree.txt
           exit 0
 
       - name: "Exit codes (read back from files)"
