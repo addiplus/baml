@@ -14,6 +14,22 @@ GENERATED="$PWD"
 WORKSPACE_ROOT="$(cd ../../../../.. && pwd)" # baml_language/
 COMMON_DIR="$WORKSPACE_ROOT/sdk_tests/crates/cpp/common"
 
+# Native cmake on Windows cannot read the POSIX-form paths bash would
+# otherwise write into the generated CMakeLists.txt below: MSYS path
+# conversion rewrites argv when it spawns a native child, never file
+# contents. Rewrite the three variables that get interpolated into
+# cmake-facing text to mixed form (D:/...), which is valid in argv, in
+# file contents, and in env vars alike, with no conversion heuristics.
+# cygpath ships with Git Bash; on Darwin and Linux this arm does not
+# match and nothing here executes.
+case "$(uname -s)" in
+    MSYS* | MINGW* | CYGWIN*)
+        GENERATED="$(cygpath -m "$GENERATED")"
+        WORKSPACE_ROOT="$(cygpath -m "$WORKSPACE_ROOT")"
+        COMMON_DIR="$(cygpath -m "$COMMON_DIR")"
+        ;;
+esac
+
 MODE="${1:-}"
 case "$MODE" in
     compile | run) ;;
