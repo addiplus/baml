@@ -115,19 +115,18 @@ jobs:
     # step's budget, not the job's.
     #
     # Nominal worst case (sum of per-step caps) after revision 3 with Option W,
-    # i.e. with the pinned-cpp-sources step (cap 8) running on all three legs:
-    #   macos   363  (revision 2 was 355; +8 pinned cpp sources)
-    #   windows 353  (revision 2 was 340; +8 pinned cpp sources, +5 bash
-    #                 launcher and canary. Still under the un-raisable 360.)
-    #   ubuntu  333  (revision 2 was 325; +8 pinned cpp sources)
-    # Stated plainly rather than left stale: the macos SUM OF CAPS is now 363,
-    # 3 over the un-raisable job cap of 360. Reaching it would require all 22
-    # steps on that leg to hit their individual caps in the same run, with the
-    # build step alone burning its full 85 min; measured macos wall time on a
-    # completely cold cache was 34.8 min, and the added step is expected to cost
-    # 1 to 2 min. The exposure is a pathological case that has never been within
-    # an order of magnitude of happening, and the alternative (trimming a cap
-    # that was sized from measurement) would buy nothing real.
+    # i.e. with the pinned-cpp-sources step (cap 8) running on all three legs,
+    # and with the build step trimmed from 85 to 81 so every leg lands strictly
+    # under the un-raisable 360:
+    #   macos   359  (was 363 before the build-cap trim; revision 2 was 355)
+    #   windows 349  (was 353 before the build-cap trim; revision 2 was 340,
+    #                 +8 pinned cpp sources, +5 bash launcher and canary)
+    #   ubuntu  329  (was 333 before the build-cap trim; revision 2 was 325)
+    # Option W's +8 pinned-cpp-sources cap had pushed the macos sum to 363, i.e.
+    # 3 over the job cap, so the build cap comes down by 4 to 81 and macos now
+    # sums to 359. That is arithmetic headroom, not a schedule change: the build
+    # step is the one cap with the most slack against measurement, and 81 min is
+    # still more than twice the measured macos wall time for the entire job.
     # Those are caps that would all have to be hit at once. Measured wall time
     # in run 31695117485, on a completely cold cache (that run was the only run
     # this fork has ever had), was macos 34.8, windows 56.6, ubuntu 36.3 min.
@@ -337,7 +336,7 @@ jobs:
       - name: "Build sdk-test crates (runs build.rs codegen)"
         if: always()
         working-directory: baml_language
-        timeout-minutes: 85
+        timeout-minutes: 81
         run: |
           set +e
           cargo test --no-run --all-features ${{ matrix.pkgs }} 2>&1 | tee ../probe-out/log/codegen.log
