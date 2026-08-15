@@ -33,6 +33,30 @@
 #      case arm matches MSYS*/MINGW*/CYGWIN* and picks bridge_cffi.dll.
 #      Windows C++ is still a BONUS, not a gap: upstream's matrix has no cpp
 #      cell on windows at all.
+#
+# Revision 3 (2026-08-15) is one more attempt at the Windows C++ cell, aimed
+# at the mechanism revision 2 MEASURED rather than at the one it assumed.
+# Revision 2's PATH prepend was proven not to matter: a native child does not
+# search PATH until after the Windows system directory, so C:\Windows\System32
+# \bash.exe (the WSL launcher) always won. Revision 3 changes three things and
+# touches no cell that passes today:
+#   1. A native launcher named bash.exe is built into target/debug/deps, the
+#      directory of the nextest test binary, which rustc's resolver searches
+#      BEFORE the system directory. It forwards to the real Git Bash by
+#      absolute path. A canary compiled into the same directory measures the
+#      resolution before and after and gates the C++ cell. Windows leg only.
+#   2. The pinned protobuf/abseil sources are created and validated, on ALL
+#      THREE legs (Option W of the design). Windows needs them created at all:
+#      setup.ps1, which is what nextest runs there, does not clone them the way
+#      setup.sh does, and the generated test.sh points cmake at them
+#      unconditionally. macOS and ubuntu need the other half, the invariant
+#      "exists AND has a CMakeLists.txt", because setup.sh's own guard is
+#      `[[ -d ]]` and run 31797094469 lost four C++ cells (exit 105) to gutted
+#      directories that guard accepted. Those four cells fail today, so this
+#      widening still touches nothing that passes.
+#   3. A contingency for the multi-config output layout that only fires if the
+#      run cell actually reaches the exec path. Windows leg only.
+# Nothing here reports pass/fail; it still only records exit codes.
 
 name: platform probe
 
@@ -90,10 +114,20 @@ jobs:
     # raised). Every step below carries its own timeout, so a hang costs that
     # step's budget, not the job's.
     #
-    # Nominal worst case (sum of per-step caps) after revision 2:
-    #   macos   355  (was 330; +25 for the python cell)
-    #   windows 340  (was 325; +5 bash-locate, +15 cpp raised 25 -> 40)
-    #   ubuntu  325  (was 330; -5 because the python cap dropped 30 -> 25)
+    # Nominal worst case (sum of per-step caps) after revision 3 with Option W,
+    # i.e. with the pinned-cpp-sources step (cap 8) running on all three legs:
+    #   macos   363  (revision 2 was 355; +8 pinned cpp sources)
+    #   windows 353  (revision 2 was 340; +8 pinned cpp sources, +5 bash
+    #                 launcher and canary. Still under the un-raisable 360.)
+    #   ubuntu  333  (revision 2 was 325; +8 pinned cpp sources)
+    # Stated plainly rather than left stale: the macos SUM OF CAPS is now 363,
+    # 3 over the un-raisable job cap of 360. Reaching it would require all 22
+    # steps on that leg to hit their individual caps in the same run, with the
+    # build step alone burning its full 85 min; measured macos wall time on a
+    # completely cold cache was 34.8 min, and the added step is expected to cost
+    # 1 to 2 min. The exposure is a pathological case that has never been within
+    # an order of magnitude of happening, and the alternative (trimming a cap
+    # that was sized from measurement) would buy nothing real.
     # Those are caps that would all have to be hit at once. Measured wall time
     # in run 31695117485, on a completely cold cache (that run was the only run
     # this fork has ever had), was macos 34.8, windows 56.6, ubuntu 36.3 min.
@@ -400,6 +434,75 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # ---- Pinned C++ sources. This runs on ALL THREE legs (Option W of the
+      # revision 3 design) and sits immediately before the first cell that
+      # consumes those sources, because each leg needs it for a different half
+      # of the same invariant.
+      #   windows: nextest binds `cpp_cdylib_win` -> crates/cpp/setup.ps1 on
+      #     cfg(windows), and that script ONLY builds bridge_cffi. Unlike
+      #     setup.sh it never pre-clones the pinned protobuf/abseil sources,
+      #     while the generated test.sh passes -DFETCHCONTENT_SOURCE_DIR_PROTOBUF
+      #     and _ABSL unconditionally, so cmake would be pointed at two
+      #     directories that do not exist.
+      #   macos + ubuntu: setup.sh does clone them, but its guard is
+      #     `[[ -d "$dest" ]] && return 0`, so a directory that exists and is
+      #     gutted is accepted. That is how run 31797094469 lost four C++ cells
+      #     to exit 105 after rust-cache restored such directories.
+      # So the invariant enforced here is "exists AND contains a
+      # CMakeLists.txt", and the step reports ABSENT / STALE / VALID rather than
+      # assuming. A directory that fails the invariant is MOVED into
+      # RUNNER_TEMP, never deleted, so the evidence survives the run.
+      # The artifact keys stay `cpp-windows-pinned-src.txt` on every leg on
+      # purpose: that is the name the revision 3 design and the reading tables
+      # already refer to, and each leg uploads its own probe-out/, so there is
+      # no collision between legs.
+      - name: "pinned cpp sources, all legs (exists AND valid, not just exists)"
+        if: always()
+        working-directory: baml_language
+        timeout-minutes: 8
+        run: |
+          set +e
+          mkdir -p ../probe-out/exit ../probe-out/log target
+          out=../probe-out/log/cpp-windows-pinned-src.txt
+          : > "${out}"
+          # Pins live in sdk_tests/crates/cpp/setup.sh; drift is reported, not guessed.
+          PB_TAG=v31.1
+          ABSL_TAG=20250127.0
+          grep -q "protobuf.git ${PB_TAG}" sdk_tests/crates/cpp/setup.sh \
+            || echo "WARN: protobuf pin drift vs setup.sh" | tee -a "${out}"
+          grep -q "abseil-cpp.git ${ABSL_TAG}" sdk_tests/crates/cpp/setup.sh \
+            || echo "WARN: abseil pin drift vs setup.sh" | tee -a "${out}"
+          rc=0
+          ensure_pinned() {
+            repo="$1"; tag="$2"; dest="$3"
+            if [ -d "${dest}" ]; then
+              if [ -f "${dest}/CMakeLists.txt" ]; then
+                echo "VALID    ${dest} (pre-existing)" | tee -a "${out}"
+                return 0
+              fi
+              echo "STALE    ${dest} (no CMakeLists.txt), moving aside" | tee -a "${out}"
+              mv "${dest}" "${RUNNER_TEMP}/stale-$(basename "${dest}")-$$" \
+                || { echo "MOVE FAILED ${dest}" | tee -a "${out}"; return 1; }
+            else
+              echo "ABSENT   ${dest}" | tee -a "${out}"
+            fi
+            echo "CLONE    ${repo} @ ${tag}" | tee -a "${out}"
+            git clone --quiet --depth 1 --branch "${tag}" "${repo}" "${dest}.tmp.$$" >> "${out}" 2>&1 \
+              || { echo "CLONE FAILED ${repo}" | tee -a "${out}"; return 1; }
+            mv "${dest}.tmp.$$" "${dest}" \
+              || { echo "RENAME FAILED ${dest}" | tee -a "${out}"; return 1; }
+            [ -f "${dest}/CMakeLists.txt" ] \
+              || { echo "INVALID AFTER CLONE ${dest}" | tee -a "${out}"; return 1; }
+            echo "VALID    ${dest} (freshly cloned)" | tee -a "${out}"
+          }
+          ensure_pinned https://github.com/protocolbuffers/protobuf.git \
+            "${PB_TAG}" target/cpp-protobuf-src || rc=1
+          ensure_pinned https://github.com/abseil/abseil-cpp.git \
+            "${ABSL_TAG}" target/cpp-absl-src || rc=1
+          echo "${rc}" > ../probe-out/exit/cpp-windows-pinned-src.txt
+          cat "${out}"
+          exit 0
+
       # ---- C++ (macOS + ubuntu). Windows gets a separate best-effort step at
       # the very end: upstream's own matrix excludes cpp on Windows because the
       # fixture driver is bash + POSIX cmake.
@@ -480,23 +583,146 @@ jobs:
           echo "python-pydantic2 exit=${code}"
           exit 0
 
+      # Windows only, and this is the measured blocker from run 31797094469.
+      # The fixture driver is spawned as Command::new("bash") from the nextest
+      # test binary. rustc 1.93.0's own resolver
+      # (library/std/src/sys/process/windows.rs, fn search_paths) searches, in
+      # order: (1) a PATH set explicitly on the Command, which the harness never
+      # sets; (2) the directory of current_exe(); (3) GetSystemDirectory(), i.e.
+      # C:\Windows\System32, where the WSL launcher lives; (4)
+      # GetWindowsDirectory(); (5) the inherited PATH. Run 31797094469 measured
+      # 3 beating 5 with Git Bash already first on PATH, which is why no PATH
+      # ordering can help. But 2 beats 3, and 2 is the test binary's own
+      # directory, target/debug/deps. So this step builds a small native
+      # launcher named bash.exe there. The launcher forwards argv to the real
+      # Git Bash by absolute path, so Git Bash runs from its own installation
+      # with its own msys root: nothing is copied out of it, and nothing on the
+      # runner is modified. A canary compiled into the same directory measures
+      # the resolution before and after. The AFTER canary is the gate: if it
+      # does not show an MSYS/MINGW shell, the C++ result below is UNKNOWN and
+      # must not be read as a verdict on the code.
+      - name: "windows: make native children resolve Git Bash (canary + launcher)"
+        if: always() && matrix.label == 'windows'
+        working-directory: baml_language
+        timeout-minutes: 5
+        run: |
+          set +e
+          mkdir -p ../probe-out/exit ../probe-out/log
+          out=../probe-out/log/cpp-windows-bashfix.txt
+          : > "${out}"
+          deps="$(pwd)/target/debug/deps"
+          work="${RUNNER_TEMP}/bashfix"
+          mkdir -p "${deps}" "${work}"
+
+          cat > "${work}/bashprobe.rs" <<'PROBE_EOF'
+          use std::process::Command;
+          fn main() {
+              println!("probe_exe: {}", std::env::current_exe().unwrap().display());
+              let r = Command::new("bash")
+                  .arg("-c")
+                  .arg("echo BASH_RESOLVED_OK; uname -s")
+                  .output();
+              match r {
+                  Ok(o) => {
+                      println!("code: {:?}", o.status.code());
+                      println!("stdout: {}", String::from_utf8_lossy(&o.stdout));
+                      println!("stderr: {}", String::from_utf8_lossy(&o.stderr));
+                  }
+                  Err(e) => println!("spawn_error: {e}"),
+              }
+          }
+          PROBE_EOF
+          rustc -O "${work}/bashprobe.rs" -o "${deps}/bashprobe.exe" >> "${out}" 2>&1
+          echo "rustc bashprobe exit=$?" >> "${out}"
+          "${deps}/bashprobe.exe" > ../probe-out/log/cpp-windows-canary-before.txt 2>&1
+          echo "--- canary BEFORE (expected: the WSL launcher, the failure of record) ---" >> "${out}"
+          cat ../probe-out/log/cpp-windows-canary-before.txt >> "${out}"
+
+          gitwin=""
+          if [ -n "${GIT_BASH_DIR:-}" ] && [ -f "${GIT_BASH_DIR}/bash.exe" ]; then
+            gitwin="$(cygpath -w "${GIT_BASH_DIR}/bash.exe")"
+          fi
+          echo "git bash (windows form): ${gitwin:-<none>}" >> "${out}"
+          fixrc=1
+          if [ -n "${gitwin}" ]; then
+            {
+              echo 'use std::process::{Command, exit};'
+              echo 'fn main() {'
+              printf '    let real = r"%s";\n' "${gitwin}"
+              echo '    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();'
+              echo '    match Command::new(real).args(&args).status() {'
+              echo '        Ok(s) => exit(s.code().unwrap_or(1)),'
+              echo '        Err(e) => { eprintln!("bash launcher failed: {e}"); exit(127); }'
+              echo '    }'
+              echo '}'
+            } > "${work}/bashlauncher.rs"
+            rustc -O "${work}/bashlauncher.rs" -o "${deps}/bash.exe" >> "${out}" 2>&1
+            fixrc=$?
+            echo "rustc bashlauncher exit=${fixrc}" >> "${out}"
+          fi
+          if [ "${fixrc}" = 0 ]; then
+            "${deps}/bash.exe" -c 'echo LAUNCHER_OK; uname -s' >> "${out}" 2>&1
+            st=$?
+            "${deps}/bash.exe" -c 'exit 42' >> "${out}" 2>&1
+            st42=$?
+            echo "launcher self-test exit=${st} (want 0), passthrough=${st42} (want 42)" >> "${out}"
+            if [ "${st}" != 0 ] || [ "${st42}" != 42 ]; then fixrc=1; fi
+          fi
+          if [ "${fixrc}" != 0 ]; then
+            echo "--- launcher unusable; fallback: move the System32 WSL launcher aside ---" >> "${out}"
+            mv "${deps}/bash.exe" "${work}/bash.exe.rejected" >> "${out}" 2>&1
+            cmd //c "takeown /f C:\Windows\System32\bash.exe" >> "${out}" 2>&1
+            cmd //c "icacls C:\Windows\System32\bash.exe /grant *S-1-5-32-544:F" >> "${out}" 2>&1
+            mv /c/Windows/System32/bash.exe /c/Windows/System32/bash.exe.wsl-aside >> "${out}" 2>&1
+            if [ -f /c/Windows/System32/bash.exe ]; then
+              echo "fallback FAILED: System32 bash.exe still present" >> "${out}"
+            else
+              echo "fallback APPLIED: System32 bash.exe moved aside" >> "${out}"
+            fi
+          fi
+
+          "${deps}/bashprobe.exe" > ../probe-out/log/cpp-windows-canary-after.txt 2>&1
+          echo "--- canary AFTER (this is the gate) ---" >> "${out}"
+          cat ../probe-out/log/cpp-windows-canary-after.txt >> "${out}"
+          if grep -q "BASH_RESOLVED_OK" ../probe-out/log/cpp-windows-canary-after.txt \
+             && grep -Eq "MINGW|MSYS|CYGWIN" ../probe-out/log/cpp-windows-canary-after.txt; then
+            echo "0" > ../probe-out/exit/cpp-windows-bashfix.txt
+          else
+            echo "1" > ../probe-out/exit/cpp-windows-bashfix.txt
+          fi
+          cat "${out}"
+          exit 0
+
       # Last, and still a BONUS rather than a gap: upstream has no Windows cpp
       # entry at all, and the comment in cargo-tests.reusable.yaml says Windows
       # joins "once the MSVC test driver lands". Revision 1 never reached C++
-      # here; it died in 0.24s because `bash` resolved to the WSL launcher on a
-      # runner with no WSL distribution. Revision 2 puts the verified Git Bash
-      # directory first on PATH so `bash test.sh` reaches a real shell.
+      # here; it died in 0.24s because `bash` resolved to the WSL launcher.
+      # Revision 2 put Git Bash first on PATH and MEASURED that this changes
+      # nothing for a native child (System32 is searched before PATH).
+      # Revision 3 fixes the resolution at the position that actually decides
+      # it, two steps above, and gates this cell on the canary.
       #
-      # Two things could still fail for reasons that are NOT our patch, and the
-      # extra logs below exist to tell them apart:
-      #   - `compile` needs cmake + MSVC to build protobuf, abseil and the SDK.
-      #   - `run` execs "$BUILD_DIR/build/fixture_tests", a single-config path.
-      #     The default generator on windows-latest is Visual Studio, which is
-      #     multi-config and writes build/Debug/fixture_tests.exe instead. That
-      #     is a fixture-driver limitation, not a codegen result.
-      # A nonzero exit here is STILL-UNVERIFIED unless the log shows a real
-      # compiler or test-assertion error.
-      - name: "cpp on windows (Git Bash first on PATH; bonus, not a gap)"
+      # What can still fail here for reasons that are NOT the patch under
+      # review, and how the logs tell them apart:
+      #   - bash still unresolved: cpp-windows-bashfix.txt = 1. Then this cell
+      #     is UNKNOWN, not a failure of the code.
+      #   - pinned sources missing or invalid: cpp-windows-pinned-src.txt = 1,
+      #     and cpp-windows-cmake.log shows a FetchContent or add_subdirectory
+      #     error naming cpp-protobuf-src / cpp-absl-src.
+      #   - toolchain: "No CMAKE_CXX_COMPILER could be found" in configure.log.
+      #   - a compile error inside cpp-protobuf-src / cpp-absl-src sources is a
+      #     dependency or toolchain result, not a codegen result.
+      # Only a compiler error naming files under
+      # sdk_tests/crates/cpp/reserved_keywords/generated/baml_sdk/ is a real
+      # result about the code under review.
+      #
+      # Note on the exec path: this fixture has no customizable/tests/*.cc
+      # (measured from run 31695117485's generated tree, which lists only
+      # baml_sdk/** and test.sh), so test.sh takes its HAVE_TESTS=0 branch and
+      # never execs "$BUILD_DIR/build/fixture_tests". Both cells therefore
+      # measure compilation of the generated SDK, on every platform equally.
+      # The contingency block below exists only in case that reading is wrong.
+      - name: "cpp on windows (native-child bash resolved; bonus, not a gap)"
         if: always() && matrix.label == 'windows'
         continue-on-error: true
         working-directory: baml_language
@@ -509,10 +735,12 @@ jobs:
           fi
           {
             echo "GIT_BASH_DIR=${GIT_BASH_DIR:-<unset>}"
-            echo "--- where.exe bash AFTER the prepend (what cargo's child sees) ---"
+            echo "--- where.exe bash (PATH order; NOT what a native child uses) ---"
             where.exe bash 2>&1
-            echo "--- version of the winner ---"
-            bash --version 2>&1 | head -1
+            echo "--- launcher next to the test binary (what a native child uses) ---"
+            ls -l target/debug/deps/bash.exe 2>&1
+            echo "--- native-child canary verdict (0 = resolved to a real shell) ---"
+            cat ../probe-out/exit/cpp-windows-bashfix.txt 2>&1
           } | tee ../probe-out/log/cpp-windows-bash.txt
 
           cargo nextest run -p sdk_test_cpp --all-features --no-fail-fast \
@@ -521,6 +749,37 @@ jobs:
           code=${PIPESTATUS[0]}
           echo "${code}" > ../probe-out/exit/cpp-windows.txt
           echo "cpp-windows exit=${code}"
+
+          find target/cpp-fixture-builds -maxdepth 4 2>/dev/null | sort | head -400 \
+            > ../probe-out/log/cpp-windows-buildtree-pass1.txt
+
+          # Contingency for the multi-config layout, and ONLY a contingency:
+          # if the run cell somehow did reach the exec, the default generator on
+          # windows-latest is multi-config and writes build/<Config>/*.exe while
+          # the driver execs build/fixture_tests. This block measures the tree
+          # first and acts only if such a binary is actually there.
+          shimmed=0
+          if [ "${code}" != 0 ]; then
+            for t in target/cpp-fixture-builds/*-run/build; do
+              [ -d "${t}" ] || continue
+              for b in "${t}"/*/fixture_tests.exe "${t}"/*/fixture_tests_cxx20.exe; do
+                [ -f "${b}" ] || continue
+                dst="${t}/$(basename "${b}")"
+                if [ ! -f "${dst}" ]; then
+                  cp "${b}" "${dst}" && shimmed=1
+                  echo "layout shim: ${b} -> ${dst}" \
+                    >> ../probe-out/log/cpp-windows-runlayout.txt
+                fi
+              done
+            done
+          fi
+          echo "${shimmed}" > ../probe-out/exit/cpp-windows-layout-shim.txt
+          if [ "${shimmed}" = 1 ]; then
+            cargo nextest run -p sdk_test_cpp --all-features --no-fail-fast \
+              -E 'package(=sdk_test_cpp) and test(reserved_keywords::run)' \
+              2>&1 | tee ../probe-out/log/cpp-windows-pass2.log
+            echo "${PIPESTATUS[0]}" > ../probe-out/exit/cpp-windows-pass2.txt
+          fi
 
           # cmake's own logs, whatever happened, so a compiler error can be told
           # apart from a missing-shell or wrong-output-path error.
