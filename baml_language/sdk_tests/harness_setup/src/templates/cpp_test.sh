@@ -34,7 +34,7 @@ case "$(uname -s)" in
         # deliberately left untouched. The variable stays unset off
         # Windows, so the guarded expansion at the cmake call below adds
         # nothing on Darwin or Linux.
-        WIN_FIXTURE_CXX_FLAGS="/DNOMINMAX"
+        WIN_FIXTURE_CXX_FLAGS="-DNOMINMAX"
         ;;
 esac
 
