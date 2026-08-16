@@ -27,6 +27,14 @@ case "$(uname -s)" in
         GENERATED="$(cygpath -m "$GENERATED")"
         WORKSPACE_ROOT="$(cygpath -m "$WORKSPACE_ROOT")"
         COMMON_DIR="$(cygpath -m "$COMMON_DIR")"
+        # Probe: define NOMINMAX for the fixture build so windows.h stops
+        # defining min/max as function-like macros. This isolates the
+        # min/max macro collision (C2062 at baml_sdk.h:1551) from its
+        # parse cascade; the cstdio stdin/stdout/stderr collisions are
+        # deliberately left untouched. The variable stays unset off
+        # Windows, so the guarded expansion at the cmake call below adds
+        # nothing on Darwin or Linux.
+        WIN_FIXTURE_CXX_FLAGS="/DNOMINMAX"
         ;;
 esac
 
@@ -91,6 +99,7 @@ mkdir -p "$BUILD_DIR"
 # Pre-cloned pinned sources from setup.sh: skips FetchContent population,
 # so concurrent configures cannot race and no network is needed here.
 cmake -S "$BUILD_DIR" -B "$BUILD_DIR/build" \
+    ${WIN_FIXTURE_CXX_FLAGS:+"-DCMAKE_CXX_FLAGS=$WIN_FIXTURE_CXX_FLAGS"} \
     -DFETCHCONTENT_SOURCE_DIR_PROTOBUF="$WORKSPACE_ROOT/target/cpp-protobuf-src" \
     -DFETCHCONTENT_SOURCE_DIR_ABSL="$WORKSPACE_ROOT/target/cpp-absl-src" \
     > "$BUILD_DIR/configure.log" 2>&1 ||
